@@ -5,9 +5,19 @@
 - **Website:** https://crispy.sh
 - **MCP endpoint:** `https://crispy.sh/api/mcp` (Streamable HTTP)
 - **Auth:** `Authorization: Bearer <your API key>`
+- **Local bridge:** `npx crispy-mcp` (stdio, for clients that cannot send headers)
 - **Docs & per-client setup:** https://crispy.sh/integrations
 
-This repository is documentation and connection config only. Crispy is a hosted service — there is nothing to install or run locally beyond pointing your MCP client at the endpoint above.
+Crispy is a hosted service, so there is no LinkedIn logic to run locally. This repository holds the connection config plus `crispy-mcp`, the official stdio bridge: a thin local MCP server that forwards every request to the hosted endpoint with your API key attached.
+
+### Which one do I need?
+
+| Your MCP client | Use this |
+| --- | --- |
+| Supports remote servers with custom headers (Claude Code, Cursor, VS Code, Windsurf, n8n) | The remote endpoint directly. Fewer moving parts, no local process. |
+| Only supports local `command` / `args` servers, or cannot set headers | `npx crispy-mcp`, the stdio bridge below. |
+
+The bridge is a transparent proxy. It does not define its own tools, so every tool Crispy ships is available through it the moment it goes live.
 
 ---
 
@@ -39,7 +49,23 @@ claude mcp add --transport http crispy https://crispy.sh/api/mcp \
 
 ### Claude Desktop
 
-Claude Desktop connects remote servers through the Connectors settings — add a custom connector pointing at `https://crispy.sh/api/mcp` with the `Authorization: Bearer YOUR_API_KEY` header. For header-less clients, bridge with `npx mcp-remote https://crispy.sh/api/mcp --header "Authorization: Bearer YOUR_API_KEY"`.
+Claude Desktop connects remote servers through the Connectors settings: add a custom connector pointing at `https://crispy.sh/api/mcp` with the `Authorization: Bearer YOUR_API_KEY` header.
+
+If your build cannot set a header, use the stdio bridge instead. `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "crispy": {
+      "command": "npx",
+      "args": ["-y", "crispy-mcp"],
+      "env": {
+        "CRISPY_API_KEY": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
 
 ### Cursor
 
@@ -111,6 +137,59 @@ Full per-client walkthroughs (including JetBrains, Codex, and more) live at http
 
 ---
 
+## The local stdio bridge: `npx crispy-mcp`
+
+Some MCP clients can only launch a local process and cannot attach an `Authorization` header to a remote server. `crispy-mcp` closes that gap. It runs as a local stdio MCP server and proxies every request straight to `https://crispy.sh/api/mcp`, adding your API key on the way out.
+
+```bash
+CRISPY_API_KEY=YOUR_API_KEY npx -y crispy-mcp
+```
+
+It speaks MCP on stdin and stdout, so you normally let your client start it rather than running it by hand.
+
+### Client config
+
+Any client that takes a `command` and `args` uses the same shape:
+
+```json
+{
+  "mcpServers": {
+    "crispy": {
+      "command": "npx",
+      "args": ["-y", "crispy-mcp"],
+      "env": {
+        "CRISPY_API_KEY": "YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+Claude Code, from the command line:
+
+```bash
+claude mcp add crispy --env CRISPY_API_KEY=YOUR_API_KEY -- npx -y crispy-mcp
+```
+
+VS Code uses `servers` instead of `mcpServers`, with the same `command`, `args` and `env` keys.
+
+### Options
+
+| Setting | How to pass it | Default |
+| --- | --- | --- |
+| API key | `CRISPY_API_KEY` env var, or `--api-key <key>` | required, no default |
+| Endpoint | `CRISPY_MCP_URL` env var | `https://crispy.sh/api/mcp` |
+
+Requires Node 18 or newer. Start it with no key and it exits non-zero, naming both ways to supply one and pointing at https://crispy.sh/dashboard/api-keys.
+
+Your key is sent to Crispy and nowhere else. It is never written to a log line or into an error message, even if the upstream response happens to echo it back.
+
+### Why it is a proxy and not a reimplementation
+
+The bridge forwards `initialize`, `tools/list`, `tools/call` and every other method untouched, and returns the response untouched. There is no hardcoded tool list to go stale, so new Crispy tools work the day they ship.
+
+---
+
 ## Why Crispy
 
 - **Native MCP server, REST API, and CLI** — not a browser extension.
@@ -129,6 +208,18 @@ Full per-client walkthroughs (including JetBrains, Codex, and more) live at http
 - Integrations & setup guides: https://crispy.sh/integrations
 - Outreach benchmarks: https://crispy.sh/linkedin-outreach-benchmarks
 
+## Development
+
+The bridge lives in `src/`, with tests that mock the upstream endpoint and never touch the network.
+
+```bash
+npm install
+npm run build
+npm test
+```
+
+Point the bridge at a local test server with `CRISPY_MCP_URL`.
+
 ## License
 
-MIT — see [LICENSE](LICENSE). This covers the documentation and configuration in this repository; the Crispy service itself is proprietary.
+MIT. See [LICENSE](LICENSE). This covers the `crispy-mcp` bridge, the documentation and the configuration in this repository; the Crispy service itself is proprietary.

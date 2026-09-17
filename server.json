@@ -4,6 +4,35 @@
   "description": "Full LinkedIn access for AI agents: leads, messaging, and campaigns with safe limits built in.",
   "version": "1.0.0",
   "websiteUrl": "https://crispy.sh",
+  "repository": {
+    "url": "https://github.com/shyftai/crispy-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "crispy-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CRISPY_API_KEY",
+          "description": "Your Crispy API key, from https://crispy.sh/dashboard/api-keys",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "CRISPY_MCP_URL",
+          "description": "Override the Crispy endpoint the bridge proxies to. Defaults to https://crispy.sh/api/mcp",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ],
   "remotes": [
     {
       "type": "streamable-http",

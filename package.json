@@ -1,0 +1,52 @@
+{
+  "name": "crispy-mcp",
+  "version": "1.0.0",
+  "description": "Local stdio MCP bridge for Crispy, the LinkedIn MCP server. Proxies every request to https://crispy.sh/api/mcp for clients that cannot send custom headers.",
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "linkedin",
+    "crispy",
+    "stdio",
+    "ai-agents"
+  ],
+  "homepage": "https://crispy.sh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shyftai/crispy-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shyftai/crispy-mcp/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "crispy-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
