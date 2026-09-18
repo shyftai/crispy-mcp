@@ -1,0 +1,46 @@
+# CI: build and test the stdio bridge on every PR.
+#
+# The suite is fully offline: fetch is injected in unit tests and the CLI test points at
+# 127.0.0.1:1 so it fails fast without a network. No secrets, no live Crispy call.
+#
+# Node is pinned to 20 and 22: 20 is the oldest line this package supports (package.json
+# engines says >=18, and 20 is the oldest non-EOL release), 22 is what most users run today.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build + test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      # The package handles a live API key. Prove the built binary refuses to start without
+      # one rather than failing later in a way a user cannot diagnose.
+      - name: refuses to start without an API key
+        run: |
+          if node dist/index.js > /tmp/out.txt 2>&1; then
+            echo "expected a non-zero exit with no API key"
+            exit 1
+          fi
+          grep -q 'CRISPY_API_KEY' /tmp/out.txt
+          grep -q 'api-key' /tmp/out.txt
