@@ -2207,6 +2207,47 @@ describe("UpstreamClient absolute body bounds", () => {
     );
   });
 
+  /**
+   * The ceiling counts what ARRIVED, not what was kept. On the error path only
+   * 64 KiB is retained, so a ceiling on the retained count can never fire above
+   * that -- and a flood is exactly the case that gets above it. The mutation
+   * `retained > this.maxBodyBytes` passed every other test in this file.
+   *
+   * Timing is the observable, so the margin is wide: the read's own deadline is
+   * three seconds away and the ceiling has to bite inside one tick.
+   */
+  it("counts a flood by what arrived, not by what it kept", async () => {
+    const flooding = scriptedBody();
+    const { fetchImpl } = recordingFetch(
+      new Response(flooding.body, { status: 500 }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      // Above the 64 KiB the error path retains, so only a count of everything
+      // that arrived can reach it.
+      maxBodyBytes: 100_000,
+      bodyReadTimeoutMs: 3_000,
+    });
+
+    const settled = client.send(TOOL_CALL).catch((e: unknown) => e);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    flooding.push("y".repeat(150_000));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The body never closes. Only the ceiling can have ended this read, and it
+    // has to have ended it already rather than at the three-second deadline.
+    expect(
+      flooding.cancelled(),
+      "the flood was still being drained 20ms in",
+    ).toBe(true);
+
+    const error = (await settled) as UpstreamError;
+    expect(error.message).toContain("HTTP 500");
+    expect(error.message).toContain("<150000 bytes, not shown>");
+  });
+
   it("says nothing of the body it abandoned but its size", async () => {
     const flooding = scriptedBody();
     const secret = "sk-live-0123456789abcdef";
