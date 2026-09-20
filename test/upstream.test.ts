@@ -1010,3 +1010,337 @@ describe("UpstreamClient shutdown", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+/**
+ * Every string this client did not author itself goes through one sink before a
+ * message can quote it, and these are the ways that sink was getting it wrong:
+ * it cut the text down before it scrubbed it, it matched a hand-written list of
+ * encodings, and it treated the endpoint url as a secret even when the url held
+ * nothing worth hiding.
+ */
+describe("UpstreamClient redaction", () => {
+  async function messageFrom(
+    response: Response,
+    options: { url?: string; apiKey?: string } = {},
+  ): Promise<string> {
+    const { fetchImpl } = recordingFetch(response);
+    const client = new UpstreamClient({
+      url: options.url ?? URL,
+      apiKey: options.apiKey ?? KEY,
+      fetchImpl,
+    });
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error).toBeInstanceOf(UpstreamError);
+    return error.message;
+  }
+
+  /**
+   * A body is cut down to a snippet before a message shows it. Cutting first
+   * splits a credential that straddles the boundary, and half a credential
+   * matches nothing a whole-key search is looking for -- so the surviving
+   * prefix went to stderr and into the JSON-RPC error the client is handed.
+   * Scrub, then cut: in that order the cut can only ever land on text that is
+   * already safe.
+   */
+  describe("when a credential straddles the snippet boundary", () => {
+    const LONG_KEY = "sk-live-0123456789abcdef0123456789ab";
+
+    it("keeps no part of a straddling key out of an http error", async () => {
+      const message = await messageFrom(
+        new Response(`${"x".repeat(480)}${LONG_KEY} and more`, { status: 500 }),
+        { apiKey: LONG_KEY },
+      );
+
+      expect(message).toContain("[redacted]");
+      expect(message).not.toContain(LONG_KEY);
+      // The prefix the old cut-then-scrub order left behind.
+      expect(message).not.toContain(LONG_KEY.slice(0, 20));
+      expect(message).not.toContain("sk-live");
+    });
+
+    it("keeps no part of a straddling key out of a not-JSON error", async () => {
+      const message = await messageFrom(
+        new Response(`${"y".repeat(480)}${LONG_KEY} and more`, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        { apiKey: LONG_KEY },
+      );
+
+      expect(message).toMatch(/not JSON/i);
+      expect(message).not.toContain(LONG_KEY.slice(0, 20));
+      expect(message).not.toContain("sk-live");
+    });
+
+    // Scrubbing first must not turn the bound off: an upstream body has no size
+    // limit and a message is read by a human.
+    it("still cuts an over-long body down to a snippet", async () => {
+      const message = await messageFrom(
+        new Response("z".repeat(4_000), { status: 500 }),
+      );
+
+      expect(message).toContain("...");
+      expect(message.length).toBeLessThan(700);
+    });
+  });
+
+  /**
+   * Enumerating encodings is a losing game. The list that was here covered the
+   * literal, encodeURIComponent, encodeURI and an all-lowercase escape form,
+   * and still missed application/x-www-form-urlencoded -- where a space is `+`
+   * -- and any mixture of escape cases. So the text is decoded and the match is
+   * made against the decoded form, which covers the encodings nobody listed.
+   */
+  describe("whatever encoding a credential arrives wearing", () => {
+    const AWKWARD = "sk live+key/with=specials";
+
+    const hex = (text: string): string =>
+      [...text]
+        .map(
+          (character) =>
+            `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+        )
+        .join("");
+
+    const FORMS: Array<[string, string]> = [
+      ["the literal key", AWKWARD],
+      ["encodeURIComponent", encodeURIComponent(AWKWARD)],
+      // Leaves `+`, `/` and `=` alone, so `+` here is a plus, not a space.
+      ["encodeURI", encodeURI(AWKWARD)],
+      [
+        "all-lowercase escapes",
+        encodeURIComponent(AWKWARD).replace(/%[0-9A-F]{2}/g, (escape) =>
+          escape.toLowerCase(),
+        ),
+      ],
+      ["mixed-case escapes", "sk%20live%2Bkey%2fwith%3dspecials"],
+      ["form-urlencoded, where a space is +", "sk+live%2Bkey%2Fwith%3Dspecials"],
+      ["every character escaped", hex(AWKWARD)],
+    ];
+
+    it.each(FORMS)("redacts %s out of a body", async (_form, encoded) => {
+      const message = await messageFrom(
+        new Response(`upstream said: ${encoded}`, { status: 500 }),
+        { apiKey: AWKWARD },
+      );
+
+      expect(message).not.toContain(encoded);
+      expect(message).not.toContain(AWKWARD);
+      expect(message).toContain("[redacted]");
+      // The redaction has to be surgical: the rest of the body is the diagnostic.
+      expect(message).toContain("upstream said:");
+    });
+
+    it.each(FORMS)("redacts %s out of the status line", async (_form, encoded) => {
+      const message = await messageFrom(
+        new Response(null, { status: 500, statusText: `rejected ${encoded}` }),
+        { apiKey: AWKWARD },
+      );
+
+      expect(message).not.toContain(encoded);
+      expect(message).not.toContain(AWKWARD);
+      expect(message).toContain("[redacted]");
+    });
+
+    // A body is not a url. `+` in an encodeURI'd string is a literal plus and
+    // in a form-encoded one it is a space, and the sink cannot know which, so
+    // it has to redact under either reading.
+    it("does not need to know which reading of + a body meant", async () => {
+      const plussed = await messageFrom(
+        new Response("upstream said: sk+live+key", { status: 500 }),
+        { apiKey: "sk live key" },
+      );
+      expect(plussed).not.toContain("sk+live+key");
+
+      const literal = await messageFrom(
+        new Response("upstream said: sk+live+key", { status: 500 }),
+        { apiKey: "sk+live+key" },
+      );
+      expect(literal).not.toContain("sk+live+key");
+    });
+  });
+
+  /**
+   * The raw url is a secret because undici quotes it back at us, query and all.
+   * That is only true of a url that carries something: strip userinfo, query
+   * and fragment from an endpoint that has none of them and the result is the
+   * url itself, so treating it as a secret redacts the endpoint out of every
+   * body that legitimately names it and destroys the diagnostic to protect
+   * nothing.
+   */
+  describe("when the endpoint carries no credential at all", () => {
+    it("lets a body name the endpoint", async () => {
+      const message = await messageFrom(
+        new Response(`route ${URL} is disabled`, { status: 500 }),
+      );
+
+      expect(message).toContain(`route ${URL} is disabled`);
+      expect(message).not.toContain("[redacted]");
+    });
+
+    it("still hides an endpoint that carries a query", async () => {
+      const leaky = `${URL}?api_key=${KEY}`;
+      const message = await messageFrom(
+        new Response(`route ${leaky} is disabled`, { status: 500 }),
+        { url: leaky },
+      );
+
+      expect(message).not.toContain(KEY);
+      expect(message).not.toContain("api_key");
+      expect(message).toContain("[redacted]");
+    });
+
+    it("still hides an endpoint that carries userinfo", async () => {
+      const leaky = "https://someone:hunter2@crispy.test/api/mcp";
+      const message = await messageFrom(
+        new Response(`route ${leaky} refused`, { status: 500 }),
+        { url: leaky },
+      );
+
+      expect(message).not.toContain("hunter2");
+      expect(message).toContain("[redacted]");
+    });
+
+    it("still hides an endpoint that carries a fragment", async () => {
+      const leaky = `${URL}#token-${KEY}`;
+      const message = await messageFrom(
+        new Response(`route ${leaky} refused`, { status: 500 }),
+        { url: leaky },
+      );
+
+      expect(message).not.toContain(KEY);
+      expect(message).toContain("[redacted]");
+    });
+  });
+});
+
+/**
+ * A response body is a diagnostic detail and nothing more. It must not gate a
+ * state transition, and reading it must not be able to outlive the request:
+ * the request timeout was cleared the moment the headers arrived, so nothing
+ * else is bounding this.
+ */
+describe("UpstreamClient when a response body never finishes", () => {
+  const INIT = { jsonrpc: "2.0", id: 1, method: "initialize" };
+
+  const SESSION_RESPONSE = (): Response =>
+    jsonResponse(
+      { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+      { headers: { "mcp-session-id": "sess-live" } },
+    );
+
+  /** A body that opens and then produces nothing until the test says so. */
+  function heldBody(): { body: ReadableStream; release: () => void } {
+    let release = (): void => undefined;
+    const body = new ReadableStream({
+      start(controller) {
+        release = () => controller.close();
+      },
+    });
+    return { body, release };
+  }
+
+  /** Lets every pending microtask run. */
+  const settle = (): Promise<void> =>
+    new Promise((resolve) => setImmediate(resolve));
+
+  it("drops the dead session when the 404 header lands, not when its body does", async () => {
+    const held = heldBody();
+    const { fetchImpl, calls } = recordingFetch([
+      SESSION_RESPONSE(),
+      new Response(held.body, { status: 404, statusText: "Not Found" }),
+      jsonResponse({ jsonrpc: "2.0", id: 8, result: {} }),
+    ]);
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      // Long enough that the deadline plays no part in this test: the
+      // invalidation has to happen without waiting for the body at all.
+      bodyReadTimeoutMs: 60_000,
+    });
+
+    await client.send(INIT);
+    expect(sessionIdOf(calls[0].init)).toBeNull();
+
+    const failing = client.send(TOOL_CALL).catch((e: unknown) => e);
+    await settle();
+
+    // The 404's own error is still waiting on a body that has not arrived. The
+    // session it killed is already gone, so the next request must not carry it.
+    await client.send({ ...TOOL_CALL, id: 8 });
+    expect(
+      sessionIdOf(calls[2].init),
+      "a session the upstream 404'd must not be sent again",
+    ).toBeNull();
+
+    held.release();
+    const error = (await failing) as UpstreamError;
+    expect(error.kind).toBe("session");
+  });
+
+  it("bounds the diagnostic read so a 404 that never finishes still answers", async () => {
+    const { fetchImpl } = recordingFetch([
+      SESSION_RESPONSE(),
+      new Response(new ReadableStream({ start: () => undefined }), {
+        status: 404,
+        statusText: "Not Found",
+      }),
+    ]);
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      bodyReadTimeoutMs: 20,
+    });
+
+    await client.send(INIT);
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.kind).toBe("session");
+    expect(error.message).toMatch(/HTTP 404/);
+    // The detail is what was given up to get an answer at all.
+    expect(error.message).not.toMatch(/upstream said/i);
+  });
+
+  /**
+   * readBody's `await response.text()` is on the happy path, and a 2xx whose
+   * body tears mid-read rejects it with a platform error worded by the
+   * platform. bridge.ts copies that message to stderr and into the JSON-RPC
+   * error, and bridge.ts holds neither the key nor the url, so it cannot
+   * sanitise anything: the containment has to be here.
+   */
+  it("turns a torn body on a 2xx into a scrubbed UpstreamError", async () => {
+    const leaky = `${URL}?api_key=${KEY}`;
+    const torn = new ReadableStream({
+      start(controller) {
+        controller.error(new TypeError(`terminated while reading ${leaky}`));
+      },
+    });
+    const { fetchImpl } = recordingFetch(
+      new Response(torn, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new UpstreamClient({ url: leaky, apiKey: KEY, fetchImpl });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(
+      error,
+      "a raw platform error reaches stderr and the client unsanitised",
+    ).toBeInstanceOf(UpstreamError);
+    expect(error.message).not.toContain(KEY);
+    expect(error.message).not.toContain("api_key");
+    // Still diagnosable: the safe endpoint and the platform's own wording.
+    expect(error.message).toContain("https://crispy.test/api/mcp");
+    expect(error.message).toMatch(/terminated/);
+  });
+});
