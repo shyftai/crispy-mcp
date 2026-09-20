@@ -19,7 +19,8 @@ export type UpstreamErrorKind =
   | "http"
   | "network"
   | "protocol"
-  | "session";
+  | "session"
+  | "shutdown";
 
 export class UpstreamError extends Error {
   readonly kind: UpstreamErrorKind;
@@ -61,6 +62,9 @@ export class UpstreamClient {
    */
   private sessionGeneration = 0;
 
+  /** Set the moment teardown starts. From then on nothing is forwarded. */
+  private stopped = false;
+
   constructor(options: UpstreamOptions) {
     this.url = options.url;
     this.apiKey = options.apiKey;
@@ -96,6 +100,17 @@ export class UpstreamClient {
   }
 
   async send(message: unknown): Promise<unknown | null> {
+    // Teardown drops the session id and then awaits the DELETE. The local
+    // transport is still accepting messages while that is in flight, and a
+    // buffered initialize forwarded here would open a new session that
+    // nothing ever deletes. Fail closed instead.
+    if (this.stopped) {
+      throw new UpstreamError(
+        "crispy-mcp is shutting down: the Crispy session is closed, so this request was not sent.",
+        "shutdown",
+      );
+    }
+
     const sentSessionId = this.sessionId;
     // Advances only if this very request is the one that moves the session on.
     let generation = this.sessionGeneration;
@@ -238,6 +253,8 @@ export class UpstreamClient {
    * that is slow, unreachable, or answers 405 because it has no teardown.
    */
   async endSession(): Promise<void> {
+    this.stopped = true;
+
     const sessionId = this.sessionId;
     if (sessionId === undefined) {
       return;

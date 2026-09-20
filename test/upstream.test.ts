@@ -572,3 +572,53 @@ describe("UpstreamClient session fencing", () => {
     expect(error.message).toContain("Not Found");
   });
 });
+
+describe("UpstreamClient shutdown", () => {
+  const INIT = { jsonrpc: "2.0", id: 1, method: "initialize" };
+
+  it("refuses a message that arrives while the session is being torn down", async () => {
+    const { fetchImpl, calls } = gatedFetch();
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const init = client.send(INIT);
+    calls[0].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-live" } },
+      ),
+    );
+    await init;
+
+    // Teardown is under way: the DELETE is out but has not come back yet.
+    const ending = client.endSession();
+    expect(calls).toHaveLength(2);
+    expect(calls[1].init.method).toBe("DELETE");
+
+    // A buffered initialize turns up mid-teardown. Forwarding it would open a
+    // brand new session that nothing will ever delete.
+    const error = (await client.send(INIT).catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error).toBeInstanceOf(UpstreamError);
+    expect(error.kind).toBe("shutdown");
+    expect(error.message).toMatch(/shutting down/i);
+    expect(calls, "nothing may be forwarded after teardown starts").toHaveLength(2);
+
+    calls[1].resolve(new Response(null, { status: 204 }));
+    await ending;
+  });
+
+  it("keeps refusing after the teardown has finished", async () => {
+    const { fetchImpl, calls } = recordingFetch(new Response(null, { status: 204 }));
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    // No session was ever established, so there is no DELETE to send -- but
+    // the door still has to be shut.
+    await client.endSession();
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.kind).toBe("shutdown");
+    expect(calls).toHaveLength(0);
+  });
+});
