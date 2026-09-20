@@ -47,10 +47,11 @@ export class UpstreamClient {
   private readonly apiKey: string;
 
   /**
-   * The endpoint as it is allowed to appear in a message. CRISPY_MCP_URL is
-   * user-supplied and unrestricted, so the key may well be sitting in a query
-   * component -- and these messages go to stderr *and* back to the client as
-   * a JSON-RPC error. Nothing may interpolate `url`; interpolate this.
+   * The endpoint as it is allowed to appear in a message: origin and path,
+   * nothing else. CRISPY_MCP_URL is user-supplied and unrestricted, so a
+   * credential may well be sitting in a query component or in userinfo -- and
+   * these messages go to stderr *and* back to the client as a JSON-RPC error.
+   * Nothing may interpolate `url`; interpolate this.
    */
   private readonly safeUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -76,19 +77,45 @@ export class UpstreamClient {
   constructor(options: UpstreamOptions) {
     this.url = options.url;
     this.apiKey = options.apiKey;
-    this.safeUrl = this.redact(options.url);
+    this.safeUrl = this.endpointForMessage(options.url);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.teardownTimeoutMs =
       options.teardownTimeoutMs ?? DEFAULT_TEARDOWN_TIMEOUT_MS;
   }
 
-  /** Strips the api key out of anything on its way to a log or an error. */
+  /**
+   * Strips the api key out of anything on its way to a log or an error. This
+   * is the right shape for a body or a status line, where the key can only
+   * appear verbatim. It is the wrong shape for a url: see endpointForMessage.
+   */
   private redact(text: string): string {
     if (this.apiKey === "") {
       return text;
     }
     return text.split(this.apiKey).join("[redacted]");
+  }
+
+  /**
+   * Reduces the endpoint to the part that identifies it and drops the parts
+   * that can carry a credential. Matching the key as a string is not enough:
+   * a key in a query component is percent-encoded, so `?api_key=a%20b` shares
+   * no substring with the key `a b` and survives redaction untouched.
+   *
+   * Parsing is defensive on purpose. This runs on the error path, so a url the
+   * URL parser rejects must produce a worse message, never a thrown one.
+   */
+  private endpointForMessage(url: string): string {
+    try {
+      const parsed = new URL(url);
+      parsed.username = "";
+      parsed.password = "";
+      parsed.search = "";
+      parsed.hash = "";
+      return this.redact(parsed.toString());
+    } catch {
+      return this.redact(url);
+    }
   }
 
   private headers(): Record<string, string> {
@@ -152,17 +179,24 @@ export class UpstreamClient {
       clearTimeout(timer);
     }
 
+    // A session exists only if the server accepted the request that created
+    // it. Adopting before this check let a 500 install an id that no handshake
+    // stands behind, and let a 404 install one and invalidate it in the same
+    // breath while the caller was told its session had merely expired.
+    if (!response.ok) {
+      throw await this.httpError(response, sentSessionId, generation);
+    }
+
     const sessionId = response.headers.get("mcp-session-id");
     if (
       sessionId !== null &&
       sessionId !== "" &&
+      // Teardown has begun: see endSession. This response left before the
+      // signal arrived, so `stopped` is the only thing still fencing it.
+      !this.stopped &&
       generation === this.sessionGeneration
     ) {
       generation = this.adoptSession(sessionId);
-    }
-
-    if (!response.ok) {
-      throw await this.httpError(response, sentSessionId, generation);
     }
 
     const body = await this.readBody(response);
@@ -174,14 +208,28 @@ export class UpstreamClient {
 
   /**
    * Records the id the upstream assigned and returns the generation the caller
-   * is now in. A *different* id means the previous session is finished, so
-   * anything still in flight under it gets fenced off.
+   * is now in. Adopting an id -- any id, including the first -- moves the
+   * session on, so everything still in flight under the old state is fenced
+   * off. Bumping only when the id *changed* left the opening case unfenced:
+   * two requests that both leave before any session exists snapshot the same
+   * generation, and the second would sail through the guard and replace what
+   * the first had just adopted.
    */
   private adoptSession(sessionId: string): number {
-    if (this.sessionId !== undefined && this.sessionId !== sessionId) {
-      this.sessionGeneration += 1;
+    if (this.sessionId === sessionId) {
+      return this.sessionGeneration;
     }
+
+    // A replacement is a new session, and the protocol version was negotiated
+    // with the old one. rememberProtocolVersion only writes into an empty
+    // slot, so leaving it behind would pin the new session to the old
+    // session's version on every later request.
+    if (this.sessionId !== undefined) {
+      this.protocolVersion = undefined;
+    }
+
     this.sessionId = sessionId;
+    this.sessionGeneration += 1;
     return this.sessionGeneration;
   }
 
@@ -265,15 +313,29 @@ export class UpstreamClient {
    * that is slow, unreachable, or answers 405 because it has no teardown.
    */
   async endSession(): Promise<void> {
+    // Teardown fences what is already in flight as well as what comes after
+    // it. `stopped` turns away new sends *and* blocks the adoption of a
+    // session id by a request that is already past that check, and the
+    // generation bump below fences responses that snapshotted the live
+    // generation on their way out. Both are needed: returning early with no
+    // cached id used to skip the bump entirely, so an initialize that left
+    // before the signal came back afterwards and quietly became live state.
+    //
+    // Such a late id is abandoned, not DELETEd. Deleting it would mean opening
+    // a fresh bounded request after the shutdown handshake has already spent
+    // its deadline -- the process may be gone before it lands, and the caller
+    // would be waiting on a second teardown it never asked for. Abandoning is
+    // safe because the id never enters this client: nothing can send under it,
+    // and the server reaps an untouched session on its own idle timeout.
     this.stopped = true;
 
     const sessionId = this.sessionId;
+    const headers = this.headers();
+    this.invalidateSession();
+
     if (sessionId === undefined) {
       return;
     }
-
-    const headers = this.headers();
-    this.invalidateSession();
 
     const controller = new AbortController();
     const timer = setTimeout(() => {

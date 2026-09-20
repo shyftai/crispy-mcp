@@ -316,6 +316,77 @@ describe("UpstreamClient.send", () => {
     expect(error.message).toContain("no such endpoint");
   });
 
+  // A replacement session is a new session. rememberProtocolVersion only
+  // writes when the version is unset, so a version carried over from the old
+  // one would be sent with every later request under the new id.
+  it("negotiates the protocol version again when a new session replaces the old", async () => {
+    const { fetchImpl, calls } = recordingFetch([
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-a" } },
+      ),
+      jsonResponse(
+        { jsonrpc: "2.0", id: 2, result: { protocolVersion: "2025-03-26" } },
+        { headers: { "mcp-session-id": "sess-b" } },
+      ),
+      jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }),
+    ]);
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    await client.send({ jsonrpc: "2.0", id: 1, method: "initialize" });
+    await client.send({ jsonrpc: "2.0", id: 2, method: "initialize" });
+    await client.send(TOOL_CALL);
+
+    const headers = new Headers(calls[2].init.headers as HeadersInit);
+    expect(headers.get("mcp-session-id")).toBe("sess-b");
+    expect(
+      headers.get("mcp-protocol-version"),
+      "sess-b must not inherit the version sess-a negotiated",
+    ).toBe("2025-03-26");
+  });
+
+  // A session only exists if the server accepted the request that created it.
+  it("does not install a session id carried by a 500", async () => {
+    const { fetchImpl, calls } = recordingFetch([
+      jsonResponse(
+        { error: "boom" },
+        { status: 500, headers: { "mcp-session-id": "sess-from-a-500" } },
+      ),
+      jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }),
+    ]);
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error.kind).toBe("http");
+
+    await client.send(TOOL_CALL);
+    expect(
+      sessionIdOf(calls[1].init),
+      "a rejected response must not leave a session behind",
+    ).toBeNull();
+  });
+
+  it("does not install a session id carried by a 404", async () => {
+    const { fetchImpl, calls } = recordingFetch([
+      jsonResponse(
+        { error: "no such endpoint" },
+        { status: 404, headers: { "mcp-session-id": "sess-from-a-404" } },
+      ),
+      jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }),
+    ]);
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error.kind).toBe("http");
+
+    await client.send(TOOL_CALL);
+    expect(sessionIdOf(calls[1].init)).toBeNull();
+  });
+
   it("never puts the api key in an error message, even if the upstream echoes it", async () => {
     const { fetchImpl } = recordingFetch(
       jsonResponse({ error: `key ${KEY} is revoked` }, { status: 500 }),
@@ -347,8 +418,67 @@ describe("UpstreamClient.send", () => {
   // CRISPY_MCP_URL is user-supplied and unrestricted. An endpoint that carries
   // the key in a query component turns every message that names the url into a
   // leak -- onto stderr and into the JSON-RPC error the client is handed.
+  // String-matching the key is the wrong shape for a url: a credential can sit
+  // in userinfo, or percent-encoded in the query, and match nothing. So the url
+  // that reaches a message keeps its origin and path and loses the rest.
   describe("when the endpoint url itself carries the api key", () => {
     const LEAKY_URL = `https://crispy.test/api/mcp?api_key=${KEY}`;
+
+    /** Fails the way an unreachable endpoint does, without touching a socket. */
+    const refusingFetch = (async () => {
+      throw new TypeError("fetch failed: ECONNREFUSED");
+    }) as unknown as typeof fetch;
+
+    async function messageFor(url: string, apiKey: string): Promise<string> {
+      const client = new UpstreamClient({
+        url,
+        apiKey,
+        fetchImpl: refusingFetch,
+      });
+      const error = (await client
+        .send(TOOL_CALL)
+        .catch((e: unknown) => e)) as UpstreamError;
+      expect(error).toBeInstanceOf(UpstreamError);
+      return error.message;
+    }
+
+    // The literal key never appears in the url, so redact() matches nothing.
+    it("strips a percent-encoded key that redaction cannot match", async () => {
+      const awkwardKey = "sk live/+key";
+      const encoded = encodeURIComponent(awkwardKey);
+      expect(encoded).not.toContain(awkwardKey);
+
+      const message = await messageFor(
+        `https://crispy.test/api/mcp?api_key=${encoded}`,
+        awkwardKey,
+      );
+
+      expect(message).not.toContain(encoded);
+      expect(message).not.toContain(awkwardKey);
+      expect(message).not.toContain("api_key");
+      expect(message).toContain("https://crispy.test/api/mcp");
+    });
+
+    it("strips userinfo and the fragment as well as the query", async () => {
+      const message = await messageFor(
+        "https://someone:hunter2@crispy.test/api/mcp?token=abc#frag",
+        KEY,
+      );
+
+      expect(message).not.toContain("hunter2");
+      expect(message).not.toContain("someone");
+      expect(message).not.toContain("token=abc");
+      expect(message).not.toContain("frag");
+      expect(message).toContain("https://crispy.test/api/mcp");
+    });
+
+    // Sanitising happens on the error path. It must not become the error.
+    it("still reports the failure when the url will not parse", async () => {
+      const message = await messageFor("not-a-url", KEY);
+
+      expect(message).toMatch(/could not reach crispy/i);
+      expect(message).toContain("not-a-url");
+    });
 
     it("keeps the key out of the network-failure message", async () => {
       const fetchImpl = (async () => {
@@ -366,9 +496,9 @@ describe("UpstreamClient.send", () => {
 
       expect(error.kind).toBe("network");
       expect(error.message).not.toContain(KEY);
+      expect(error.message).not.toContain("api_key");
       // The endpoint still has to be identifiable, or the error is useless.
       expect(error.message).toContain("https://crispy.test/api/mcp");
-      expect(error.message).toContain("[redacted]");
     });
 
     it("keeps the key out of the timeout message", async () => {
@@ -396,8 +526,8 @@ describe("UpstreamClient.send", () => {
 
       expect(error.message).toMatch(/timed out/i);
       expect(error.message).not.toContain(KEY);
+      expect(error.message).not.toContain("api_key");
       expect(error.message).toContain("https://crispy.test/api/mcp");
-      expect(error.message).toContain("[redacted]");
     });
   });
 });
@@ -558,6 +688,46 @@ describe("UpstreamClient session fencing", () => {
     return { client, calls };
   }
 
+  // Nothing has a session yet, so nothing has an id to compare against: both
+  // requests snapshot the same generation on the way out. Fencing only on a
+  // *changed* id leaves this case wide open.
+  it("keeps the first session when two concurrent requests each open one", async () => {
+    const { fetchImpl, calls } = gatedFetch();
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const first = client.send(INIT);
+    const second = client.send(TOOL_CALL);
+    expect(calls).toHaveLength(2);
+    expect(sessionIdOf(calls[0].init)).toBeNull();
+    expect(sessionIdOf(calls[1].init)).toBeNull();
+
+    calls[0].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-a" } },
+      ),
+    );
+    await first;
+
+    // The second answer names a different session. It left before sess-a
+    // existed, so it knows nothing about the session it would be replacing.
+    calls[1].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 7, result: { content: [] } },
+        { headers: { "mcp-session-id": "sess-b" } },
+      ),
+    );
+    await second;
+
+    const next = client.send(TOOL_CALL);
+    expect(
+      sessionIdOf(calls[2].init),
+      "the second response must not abandon the session the first adopted",
+    ).toBe("sess-a");
+    calls[2].resolve(jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }));
+    await next;
+  });
+
   it("does not let a slow response resurrect a session a concurrent 404 just killed", async () => {
     const { client, calls } = await connected("sess-a");
 
@@ -574,18 +744,26 @@ describe("UpstreamClient session fencing", () => {
       "session",
     );
 
-    // The first lands late, still echoing the id that is now dead.
+    // The first lands late, still echoing the id that is now dead -- and
+    // carrying a protocol version, so the stale body has something to write
+    // back with as well as an id.
     calls[1].resolve(
       jsonResponse(
-        { jsonrpc: "2.0", id: 7, result: { content: [] } },
+        {
+          jsonrpc: "2.0",
+          id: 7,
+          result: { content: [], protocolVersion: "1999-01-01" },
+        },
         { headers: { "mcp-session-id": "sess-a" } },
       ),
     );
     await slow;
 
-    // The dead id must not have come back to life.
+    // Neither the dead id nor the version that came back with it may survive.
     const next = client.send(TOOL_CALL);
-    expect(sessionIdOf(calls[3].init)).toBeNull();
+    const headers = new Headers(calls[3].init.headers as HeadersInit);
+    expect(headers.get("mcp-session-id")).toBeNull();
+    expect(headers.get("mcp-protocol-version")).toBeNull();
     calls[3].resolve(jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }));
     await next;
   });
@@ -687,6 +865,43 @@ describe("UpstreamClient shutdown", () => {
 
     calls[1].resolve(new Response(null, { status: 204 }));
     await ending;
+  });
+
+  // Teardown has to fence what is already in flight, not only what comes
+  // after it. An initialize that left before the signal arrived is not
+  // fenced by `stopped` -- it is already past that check.
+  it("does not adopt a session from an initialize that lands mid-teardown", async () => {
+    const { fetchImpl, calls } = gatedFetch();
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const init = client.send(INIT);
+    expect(calls).toHaveLength(1);
+
+    // The signal arrives before the upstream has answered. There is no session
+    // yet, so teardown has no DELETE to send.
+    await client.endSession();
+    expect(calls).toHaveLength(1);
+
+    // Only now does the answer land, handing out a brand new session.
+    calls[0].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-too-late" } },
+      ),
+    );
+    await init;
+
+    // Had that id been adopted it would now be live client state -- and a
+    // second teardown would find it and DELETE it. There must be nothing to
+    // find: the id was abandoned, never owned. (Not awaited first: a DELETE
+    // is issued synchronously, so the count is checked before a teardown that
+    // should not be happening gets a chance to block on its gate.)
+    const again = client.endSession();
+    expect(
+      calls,
+      "a session adopted after teardown began is state nobody owns",
+    ).toHaveLength(1);
+    await again;
   });
 
   it("keeps refusing after the teardown has finished", async () => {
