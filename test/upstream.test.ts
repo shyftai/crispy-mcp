@@ -36,6 +36,30 @@ function jsonResponse(
   });
 }
 
+/**
+ * A fetch whose responses the test settles by hand. `calls` fills synchronously
+ * as each send() is issued, so two sends are genuinely in flight at once and
+ * the test chooses the order their responses land in.
+ */
+function gatedFetch() {
+  const calls: Array<{
+    url: string;
+    init: RequestInit;
+    resolve: (response: Response) => void;
+  }> = [];
+
+  const fetchImpl = ((input: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((resolve) => {
+      calls.push({ url: String(input), init: init ?? {}, resolve });
+    })) as unknown as typeof fetch;
+
+  return { fetchImpl: fetchImpl as unknown as typeof fetch, calls };
+}
+
+function sessionIdOf(init: RequestInit): string | null {
+  return new Headers(init.headers as HeadersInit).get("mcp-session-id");
+}
+
 const TOOL_CALL = {
   jsonrpc: "2.0",
   id: 7,
@@ -429,5 +453,122 @@ describe("UpstreamClient.endSession", () => {
 
     await expect(client.endSession()).resolves.toBeUndefined();
     expect(hangingSignal?.aborted).toBe(true);
+  });
+});
+
+describe("UpstreamClient session fencing", () => {
+  const INIT = { jsonrpc: "2.0", id: 1, method: "initialize" };
+
+  /** Establishes `id` as the live session and returns the gate for later calls. */
+  async function connected(id: string) {
+    const { fetchImpl, calls } = gatedFetch();
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const init = client.send(INIT);
+    calls[0].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": id } },
+      ),
+    );
+    await init;
+
+    return { client, calls };
+  }
+
+  it("does not let a slow response resurrect a session a concurrent 404 just killed", async () => {
+    const { client, calls } = await connected("sess-a");
+
+    // Two calls leave together, both carrying sess-a.
+    const slow = client.send(TOOL_CALL);
+    const fast = client.send(TOOL_CALL);
+    expect(calls).toHaveLength(3);
+    expect(sessionIdOf(calls[1].init)).toBe("sess-a");
+    expect(sessionIdOf(calls[2].init)).toBe("sess-a");
+
+    // The second one comes back first: the session is gone.
+    calls[2].resolve(jsonResponse({ error: "session not found" }, { status: 404 }));
+    expect(((await fast.catch((e: unknown) => e)) as UpstreamError).kind).toBe(
+      "session",
+    );
+
+    // The first lands late, still echoing the id that is now dead.
+    calls[1].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 7, result: { content: [] } },
+        { headers: { "mcp-session-id": "sess-a" } },
+      ),
+    );
+    await slow;
+
+    // The dead id must not have come back to life.
+    const next = client.send(TOOL_CALL);
+    expect(sessionIdOf(calls[3].init)).toBeNull();
+    calls[3].resolve(jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }));
+    await next;
+  });
+
+  it("does not let a late 404 from a dead session clear the session that replaced it", async () => {
+    const { client, calls } = await connected("sess-a");
+
+    // Two calls leave together under sess-a.
+    const late = client.send(TOOL_CALL);
+    const first = client.send(TOOL_CALL);
+
+    // One 404s, so sess-a is dropped.
+    calls[2].resolve(jsonResponse({ error: "session not found" }, { status: 404 }));
+    expect(((await first.catch((e: unknown) => e)) as UpstreamError).kind).toBe(
+      "session",
+    );
+
+    // The client reconnects and the upstream hands out a fresh session.
+    const reinit = client.send({ jsonrpc: "2.0", id: 2, method: "initialize" });
+    expect(sessionIdOf(calls[3].init)).toBeNull();
+    calls[3].resolve(
+      jsonResponse(
+        { jsonrpc: "2.0", id: 2, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-b" } },
+      ),
+    );
+    await reinit;
+
+    // Only now does the old generation's 404 land. It still fails its own
+    // request, but it must not touch the healthy session that replaced it.
+    calls[1].resolve(jsonResponse({ error: "session not found" }, { status: 404 }));
+    expect(((await late.catch((e: unknown) => e)) as UpstreamError).kind).toBe(
+      "session",
+    );
+
+    const next = client.send(TOOL_CALL);
+    expect(sessionIdOf(calls[4].init)).toBe("sess-b");
+    calls[4].resolve(jsonResponse({ jsonrpc: "2.0", id: 7, result: {} }));
+    await next;
+  });
+
+  it("keeps the http status in the session error so a misrouted endpoint stays diagnosable", async () => {
+    const { fetchImpl } = recordingFetch([
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-live" } },
+      ),
+      new Response(JSON.stringify({ error: "no such route" }), {
+        status: 404,
+        statusText: "Not Found",
+        headers: { "content-type": "application/json" },
+      }),
+    ]);
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+    await client.send(INIT);
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.kind).toBe("session");
+    expect(error.message).toMatch(/expired/i);
+    // A wrong CRISPY_MCP_URL 404s exactly like an expired session. The advice
+    // stays, but the status has to survive or the misroute is invisible.
+    expect(error.message).toContain("404");
+    expect(error.message).toContain("Not Found");
   });
 });

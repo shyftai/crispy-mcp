@@ -51,6 +51,16 @@ export class UpstreamClient {
   private sessionId: string | undefined;
   private protocolVersion: string | undefined;
 
+  /**
+   * Bumped every time the session is invalidated or replaced. The bridge
+   * dispatches messages concurrently, so several requests are normally in
+   * flight at once: each one snapshots this counter on its way out, and a
+   * response whose snapshot has since moved on belongs to a session that no
+   * longer exists. It must not write anything back into this client -- neither
+   * to resurrect a dead id nor to clear the live one that replaced it.
+   */
+  private sessionGeneration = 0;
+
   constructor(options: UpstreamOptions) {
     this.url = options.url;
     this.apiKey = options.apiKey;
@@ -87,6 +97,8 @@ export class UpstreamClient {
 
   async send(message: unknown): Promise<unknown | null> {
     const sentSessionId = this.sessionId;
+    // Advances only if this very request is the one that moves the session on.
+    let generation = this.sessionGeneration;
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort(new Error("timeout"));
@@ -117,17 +129,43 @@ export class UpstreamClient {
     }
 
     const sessionId = response.headers.get("mcp-session-id");
-    if (sessionId !== null && sessionId !== "") {
-      this.sessionId = sessionId;
+    if (
+      sessionId !== null &&
+      sessionId !== "" &&
+      generation === this.sessionGeneration
+    ) {
+      generation = this.adoptSession(sessionId);
     }
 
     if (!response.ok) {
-      throw await this.httpError(response, sentSessionId);
+      throw await this.httpError(response, sentSessionId, generation);
     }
 
     const body = await this.readBody(response);
-    this.rememberProtocolVersion(body);
+    if (generation === this.sessionGeneration) {
+      this.rememberProtocolVersion(body);
+    }
     return body;
+  }
+
+  /**
+   * Records the id the upstream assigned and returns the generation the caller
+   * is now in. A *different* id means the previous session is finished, so
+   * anything still in flight under it gets fenced off.
+   */
+  private adoptSession(sessionId: string): number {
+    if (this.sessionId !== undefined && this.sessionId !== sessionId) {
+      this.sessionGeneration += 1;
+    }
+    this.sessionId = sessionId;
+    return this.sessionGeneration;
+  }
+
+  /** Drops the session and fences every request still in flight under it. */
+  private invalidateSession(): void {
+    this.sessionId = undefined;
+    this.protocolVersion = undefined;
+    this.sessionGeneration += 1;
   }
 
   /**
@@ -147,6 +185,7 @@ export class UpstreamClient {
   private async httpError(
     response: Response,
     sentSessionId: string | undefined,
+    generation: number,
   ): Promise<UpstreamError> {
     const body = this.redact((await this.safeText(response)).trim());
 
@@ -154,11 +193,16 @@ export class UpstreamClient {
     // anything still carrying that id with a 404. Retrying is not ours to do:
     // only the client can re-run initialize, so drop the dead state and say so.
     if (response.status === 404 && sentSessionId !== undefined) {
-      this.sessionId = undefined;
-      this.protocolVersion = undefined;
+      if (generation === this.sessionGeneration) {
+        this.invalidateSession();
+      }
+      // A wrong CRISPY_MCP_URL, a bad deploy and a genuinely dropped session
+      // all look like this. The advice is right for the common case, but the
+      // status has to survive or a misrouted endpoint is undiagnosable.
+      const status = `HTTP ${response.status} ${response.statusText}`.trim();
       return new UpstreamError(
         [
-          "The Crispy session expired: the server no longer recognises this session id.",
+          `The Crispy session expired: ${status} -- the server no longer recognises this session id.`,
           "Reconnect your MCP client so it runs initialize again.",
           body === "" ? "" : `Upstream said: ${body}`,
         ]
@@ -200,7 +244,7 @@ export class UpstreamClient {
     }
 
     const headers = this.headers();
-    this.sessionId = undefined;
+    this.invalidateSession();
 
     const controller = new AbortController();
     const timer = setTimeout(() => {
