@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { SESSION_ERROR_CODE, attachBridge } from "../src/bridge";
+import {
+  SESSION_ERROR_CODE,
+  UPSTREAM_ERROR_CODE,
+  attachBridge,
+} from "../src/bridge";
 import { UpstreamClient } from "../src/upstream";
 
 const KEY = "fake-test-key-bridge-only";
@@ -203,7 +207,13 @@ describe("attachBridge", () => {
       error: { code: number; message: string };
     };
     expect(response.id).toBe(42);
-    expect(response.error.code).toBe(SESSION_ERROR_CODE);
+    // The wire value, not the constant: comparing against the import passes
+    // however the constant is defined, including as UPSTREAM_ERROR_CODE, which
+    // is the one thing this test exists to rule out. A client keys off the
+    // number, so the number is the contract.
+    expect(response.error.code).toBe(-32002);
+    expect(SESSION_ERROR_CODE).toBe(-32002);
+    expect(SESSION_ERROR_CODE).not.toBe(UPSTREAM_ERROR_CODE);
     expect(response.error.message).toMatch(/expired/i);
   });
 

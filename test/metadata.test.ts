@@ -35,9 +35,14 @@ const npmPackage = server.packages?.find(
   (entry) => entry.registryType === "npm",
 );
 
-/** major.minor.patch, with an optional prerelease and build metadata. */
+/**
+ * The published semver 2.0.0 grammar, verbatim. The hand-rolled `(\d+)` version
+ * of this accepted `01.1.0` and a prerelease of `-01`: both are rejected by
+ * semver and neither is a version npm will ever hold, so a test built on that
+ * regex was not checking the thing it said it was.
+ */
 const SEMVER =
-  /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 
 type Core = [number, number, number];
 
@@ -52,6 +57,14 @@ function isAbove(version: Core, floor: Core): boolean {
 
 describe("registry manifests", () => {
   it("claims the server name in package.json so the registry can verify npm ownership", () => {
+    // Presence first. Two absent fields are not two fields that agree, and
+    // `undefined === undefined` passed this while neither manifest named the
+    // server at all -- which is the exact state the registry rejects.
+    expect(pkg.mcpName, "package.json has no mcpName").toBeTypeOf("string");
+    expect(pkg.mcpName, "package.json mcpName is empty").not.toBe("");
+    expect(server.name, "server.json has no name").toBeTypeOf("string");
+    expect(server.name, "server.json name is empty").not.toBe("");
+
     expect(
       pkg.mcpName,
       "package.json mcpName must equal server.json name, or the MCP Registry rejects the npm package as unverified",
@@ -101,4 +114,27 @@ describe("registry manifests", () => {
     expect(server.version).toBe(pkg.version);
     expect(npmPackage?.version).toBe(pkg.version);
   });
+
+  // SEMVER is the whole of the assertion above, so it gets held honest here:
+  // a regex that accepts a version npm would refuse proves nothing about
+  // publishability, and the previous one accepted two of them.
+  it.each([
+    "01.1.0",
+    "1.01.0",
+    "1.1.00",
+    "1.1.0-01",
+    "1.1",
+    "1.1.0-",
+    "v1.1.0",
+    "",
+  ])("does not accept %s as a semver", (version) => {
+    expect(SEMVER.test(version), `${version} is not a semver`).toBe(false);
+  });
+
+  it.each(["1.1.0", "0.0.4", "1.1.0-rc.1", "1.1.0-0", "1.1.0+build.5", "1.1.0-rc.1+build.5"])(
+    "accepts %s as a semver",
+    (version) => {
+      expect(SEMVER.test(version), `${version} is a semver`).toBe(true);
+    },
+  );
 });
