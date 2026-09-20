@@ -42,6 +42,45 @@ export interface UpstreamOptions {
 
 const MAX_BODY_SNIPPET = 500;
 
+const REDACTED = "[redacted]";
+
+/**
+ * Every form of `secret` that a message could plausibly quote back at us.
+ * A credential travelling inside a url arrives percent-encoded, and
+ * `?api_key=a%20b` shares no substring with the key `a b`, so matching the
+ * literal alone is not a defence.
+ */
+function secretForms(secret: string): string[] {
+  if (secret === "") {
+    return [];
+  }
+  const encoded = encodeURIComponent(secret);
+  return [
+    secret,
+    encoded,
+    encodeURI(secret),
+    // The hex digits of a percent escape are case-insensitive.
+    // encodeURIComponent emits upper case; nothing stops a server echoing
+    // lower case.
+    encoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()),
+  ];
+}
+
+/** Dedupes and orders longest-first, so the widest match wins. */
+function secretsOf(...secrets: string[]): readonly string[] {
+  return [...new Set(secrets.filter((secret) => secret !== ""))].sort(
+    (a, b) => b.length - a.length,
+  );
+}
+
+function strip(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    out = out.split(secret).join(REDACTED);
+  }
+  return out;
+}
+
 export class UpstreamClient {
   private readonly url: string;
   private readonly apiKey: string;
@@ -54,6 +93,12 @@ export class UpstreamClient {
    * Nothing may interpolate `url`; interpolate this.
    */
   private readonly safeUrl: string;
+
+  /** Every form of the api key. Sanitises the url itself; see scrub(). */
+  private readonly keyForms: readonly string[];
+
+  /** Everything that may not appear in a message. See scrub(). */
+  private readonly secrets: readonly string[];
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly teardownTimeoutMs: number;
@@ -77,7 +122,9 @@ export class UpstreamClient {
   constructor(options: UpstreamOptions) {
     this.url = options.url;
     this.apiKey = options.apiKey;
+    this.keyForms = secretsOf(...secretForms(options.apiKey));
     this.safeUrl = this.endpointForMessage(options.url);
+    this.secrets = secretsOf(options.url, ...secretForms(options.apiKey));
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.teardownTimeoutMs =
@@ -85,15 +132,25 @@ export class UpstreamClient {
   }
 
   /**
-   * Strips the api key out of anything on its way to a log or an error. This
-   * is the right shape for a body or a status line, where the key can only
-   * appear verbatim. It is the wrong shape for a url: see endpointForMessage.
+   * The sink. Every string this client did not author itself passes through
+   * here before it is interpolated into a message: a platform error, an
+   * upstream body, a status line, a header.
+   *
+   * Sanitising the url where *we* interpolate it is not enough, because we are
+   * not the only one who can put it in a message. undici rejects an
+   * unparseable url with "Failed to parse URL from <the raw url>", query and
+   * all, and that wording becomes the failure reason we go on to quote. So the
+   * raw url is a secret exactly as the key is: nothing derived from it may
+   * enter a message. Removing the raw url also covers whatever encoding a
+   * credential carried *inside* it happens to have, under whatever wording the
+   * platform chose -- which is the point of fixing this at the sink instead of
+   * matching one Node version's phrasing.
+   *
+   * This runs on the untrusted fragments, never on the assembled message:
+   * safeUrl is the sanitised url and is allowed to stay.
    */
-  private redact(text: string): string {
-    if (this.apiKey === "") {
-      return text;
-    }
-    return text.split(this.apiKey).join("[redacted]");
+  private scrub(text: string): string {
+    return strip(text, this.secrets);
   }
 
   /**
@@ -105,7 +162,7 @@ export class UpstreamClient {
    * Parsing is defensive on purpose. This runs on the error path, so a url the
    * URL parser rejects must produce a worse message, never a thrown one. Worse
    * means less: a url that will not parse is the one this function can strip
-   * nothing out of, so echoing it -- even through redact() -- prints back
+   * nothing out of, so echoing it -- even through the sink -- prints back
    * whatever credential it carries. Name the setting instead. That is enough
    * to find the problem, since the default url always parses, so an
    * unparseable one can only have come from CRISPY_MCP_URL.
@@ -117,7 +174,7 @@ export class UpstreamClient {
       parsed.password = "";
       parsed.search = "";
       parsed.hash = "";
-      return this.redact(parsed.toString());
+      return strip(parsed.toString(), this.keyForms);
     } catch {
       return "the configured endpoint (CRISPY_MCP_URL is not a valid url)";
     }
@@ -177,7 +234,7 @@ export class UpstreamClient {
       }
       const reason = error instanceof Error ? error.message : String(error);
       throw new UpstreamError(
-        `Could not reach Crispy at ${this.safeUrl}: ${this.redact(reason)}`,
+        `Could not reach Crispy at ${this.safeUrl}: ${this.scrub(reason)}`,
         "network",
       );
     } finally {
@@ -264,7 +321,7 @@ export class UpstreamClient {
     sentSessionId: string | undefined,
     generation: number,
   ): Promise<UpstreamError> {
-    const body = this.redact((await this.safeText(response)).trim());
+    const body = this.scrub((await this.safeText(response)).trim());
 
     // The spec lets the server drop a session whenever it likes and answer
     // anything still carrying that id with a 404. Retrying is not ours to do:
@@ -276,7 +333,7 @@ export class UpstreamClient {
       // A wrong CRISPY_MCP_URL, a bad deploy and a genuinely dropped session
       // all look like this. The advice is right for the common case, but the
       // status has to survive or a misrouted endpoint is undiagnosable.
-      const status = this.redact(
+      const status = this.scrub(
         `HTTP ${response.status} ${response.statusText}`.trim(),
       );
       return new UpstreamError(
@@ -305,7 +362,7 @@ export class UpstreamClient {
     }
 
     return new UpstreamError(
-      this.redact(
+      this.scrub(
         `Crispy returned HTTP ${response.status} ${response.statusText}`.trim(),
       ) + (body === "" ? "" : `: ${body}`),
       "http",
@@ -398,7 +455,7 @@ export class UpstreamClient {
       return JSON.parse(text) as unknown;
     } catch {
       throw new UpstreamError(
-        `Crispy returned a response that is not JSON: ${this.redact(
+        `Crispy returned a response that is not JSON: ${this.scrub(
           text.slice(0, MAX_BODY_SNIPPET),
         )}`,
         "protocol",

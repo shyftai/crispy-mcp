@@ -507,6 +507,70 @@ describe("UpstreamClient.send", () => {
       expect(message).toContain("CRISPY_MCP_URL");
     });
 
+    /**
+     * Every test above injects a fetch, so the only url that can reach a
+     * message is the one this client chose to interpolate -- and that one is
+     * sanitised. The platform's own fetch does not play along: undici rejects
+     * an unparseable url with "Failed to parse URL from <the raw url>", query
+     * and all. That wording becomes the failure *reason*, and the reason is
+     * interpolated too. So the url re-enters through a channel
+     * endpointForMessage never sees, and redact() cannot catch it because a
+     * percent-encoded key shares no substring with the key.
+     *
+     * No fetch is injected here on purpose: the defect lives in the wording
+     * the platform picked, which no fake can reproduce honestly.
+     */
+    describe("through an error the platform worded for us", () => {
+      async function realFetchMessage(
+        url: string,
+        apiKey: string,
+      ): Promise<string> {
+        const client = new UpstreamClient({ url, apiKey, timeoutMs: 10_000 });
+        const error = (await client
+          .send(TOOL_CALL)
+          .catch((e: unknown) => e)) as UpstreamError;
+        expect(error).toBeInstanceOf(UpstreamError);
+        return error.message;
+      }
+
+      it("keeps a percent-encoded key out of a platform parse failure", async () => {
+        const awkwardKey = "sk live+key/with=specials";
+        const encoded = encodeURIComponent(awkwardKey);
+        const unparseable = `crispy.test/api/mcp?api_key=${encoded}`;
+
+        expect(encoded).toBe("sk%20live%2Bkey%2Fwith%3Dspecials");
+        expect(() => new globalThis.URL(unparseable)).toThrow();
+
+        const message = await realFetchMessage(unparseable, awkwardKey);
+
+        expect(message).toMatch(/could not reach crispy/i);
+        expect(message).not.toContain(awkwardKey);
+        expect(message).not.toContain(encoded);
+        expect(message).not.toContain("api_key");
+        expect(message).not.toContain("crispy.test");
+        expect(message).toContain("CRISPY_MCP_URL");
+      });
+
+      /**
+       * The sink removes the url; it must not flatten the message. A url that
+       * parses and simply refuses the connection puts nothing derived from the
+       * raw url into the reason, so the reason has to come through intact --
+       * otherwise an operator cannot tell a refused connection from a dns
+       * failure. This is what fails if the sink is applied to the assembled
+       * message rather than to the untrusted fragments of it: here the raw url
+       * and the safe url are the same string.
+       */
+      it("leaves a clean platform error alone", async () => {
+        const dead = "http://127.0.0.1:1/api/mcp";
+
+        const message = await realFetchMessage(dead, KEY);
+
+        expect(message).toContain(dead);
+        expect(message).toMatch(/fetch failed/i);
+        expect(message).not.toContain("[redacted]");
+      });
+    });
+
     it("keeps the key out of the network-failure message", async () => {
       const fetchImpl = (async () => {
         throw new TypeError("fetch failed: ECONNREFUSED");
