@@ -79,41 +79,63 @@ describe("createShutdown", () => {
     expect(exited(), "still had not exited on its deadline").toBe(1);
   });
 
+  /**
+   * Each of these three asserts on the invocation as well as on the exit. "It
+   * exited" alone is not a test of throw-tolerance: a handler that never calls
+   * the throwing dependency at all exits just as cleanly, so the assertion
+   * held for the one implementation that cannot be wrong here. Pin that the
+   * throw happened *and* that the stage after it still ran.
+   */
   it("still exits when the teardown throws", async () => {
-    const { options, exited } = deps({
+    const { options, order, exited } = deps({
       endSession: async () => {
+        order.push("endSession");
         throw new Error("boom");
       },
     });
 
     await createShutdown(options)();
 
+    expect(order, "the throwing teardown was never invoked").toEqual([
+      "endSession",
+      "close",
+    ]);
     expect(exited()).toBe(1);
   });
 
   it("still exits when a teardown dependency throws synchronously", async () => {
     // close() is the SDK's, so it can throw before it ever returns a promise.
     // `.catch()` on the call only sees a rejected *return value*.
-    const { options, exited } = deps({
+    const { options, order, exited } = deps({
       close: () => {
+        order.push("close");
         throw new Error("the sdk threw before returning a promise");
       },
     });
 
     await expect(createShutdown(options)()).resolves.toBeUndefined();
 
+    expect(order, "the throwing dependency was never invoked").toEqual([
+      "endSession",
+      "close",
+    ]);
     expect(exited()).toBe(1);
   });
 
   it("still exits when the teardown throws synchronously", async () => {
-    const { options, exited } = deps({
+    const { options, order, exited } = deps({
       endSession: () => {
+        order.push("endSession");
         throw new Error("boom, synchronously");
       },
     });
 
     await expect(createShutdown(options)()).resolves.toBeUndefined();
 
+    expect(order, "the throwing teardown was never invoked").toEqual([
+      "endSession",
+      "close",
+    ]);
     expect(exited()).toBe(1);
   });
 
