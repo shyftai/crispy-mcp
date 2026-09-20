@@ -477,7 +477,34 @@ describe("UpstreamClient.send", () => {
       const message = await messageFor("not-a-url", KEY);
 
       expect(message).toMatch(/could not reach crispy/i);
-      expect(message).toContain("not-a-url");
+      // Naming the setting is all the identification an unparseable url gets.
+      expect(message).toContain("CRISPY_MCP_URL");
+    });
+
+    // The unparseable url is the one case sanitising cannot do anything with:
+    // nothing was stripped out of it, so every credential it carries is still
+    // in it. Falling back to redact() is no defence -- that is the string
+    // match this whole describe block exists because it does not work. And the
+    // case is reachable: config.ts only trims CRISPY_MCP_URL, so a url with no
+    // scheme reaches the client, new URL() rejects it, and fetch() fails.
+    it("never echoes a url that will not parse, key or no key", async () => {
+      const awkwardKey = "sk live+key/with=specials";
+      const encoded = encodeURIComponent(awkwardKey);
+      const unparseable = `crispy.test/api/mcp?api_key=${encoded}`;
+
+      expect(encoded).toBe("sk%20live%2Bkey%2Fwith%3Dspecials");
+      expect(() => new globalThis.URL(unparseable)).toThrow();
+      // What an operator reading stderr would get back out of the message.
+      expect(decodeURIComponent(encoded)).toBe(awkwardKey);
+
+      const message = await messageFor(unparseable, awkwardKey);
+
+      expect(message).toMatch(/could not reach crispy/i);
+      expect(message).not.toContain(awkwardKey);
+      expect(message).not.toContain(encoded);
+      expect(message).not.toContain("api_key");
+      expect(message).not.toContain("crispy.test");
+      expect(message).toContain("CRISPY_MCP_URL");
     });
 
     it("keeps the key out of the network-failure message", async () => {

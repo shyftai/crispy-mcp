@@ -103,7 +103,12 @@ export class UpstreamClient {
    * no substring with the key `a b` and survives redaction untouched.
    *
    * Parsing is defensive on purpose. This runs on the error path, so a url the
-   * URL parser rejects must produce a worse message, never a thrown one.
+   * URL parser rejects must produce a worse message, never a thrown one. Worse
+   * means less: a url that will not parse is the one this function can strip
+   * nothing out of, so echoing it -- even through redact() -- prints back
+   * whatever credential it carries. Name the setting instead. That is enough
+   * to find the problem, since the default url always parses, so an
+   * unparseable one can only have come from CRISPY_MCP_URL.
    */
   private endpointForMessage(url: string): string {
     try {
@@ -114,7 +119,7 @@ export class UpstreamClient {
       parsed.hash = "";
       return this.redact(parsed.toString());
     } catch {
-      return this.redact(url);
+      return "the configured endpoint (CRISPY_MCP_URL is not a valid url)";
     }
   }
 
