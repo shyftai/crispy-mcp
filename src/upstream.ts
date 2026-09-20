@@ -45,6 +45,14 @@ const MAX_BODY_SNIPPET = 500;
 export class UpstreamClient {
   private readonly url: string;
   private readonly apiKey: string;
+
+  /**
+   * The endpoint as it is allowed to appear in a message. CRISPY_MCP_URL is
+   * user-supplied and unrestricted, so the key may well be sitting in a query
+   * component -- and these messages go to stderr *and* back to the client as
+   * a JSON-RPC error. Nothing may interpolate `url`; interpolate this.
+   */
+  private readonly safeUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly teardownTimeoutMs: number;
@@ -68,6 +76,7 @@ export class UpstreamClient {
   constructor(options: UpstreamOptions) {
     this.url = options.url;
     this.apiKey = options.apiKey;
+    this.safeUrl = this.redact(options.url);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.teardownTimeoutMs =
@@ -130,13 +139,13 @@ export class UpstreamClient {
     } catch (error) {
       if (controller.signal.aborted) {
         throw new UpstreamError(
-          `Crispy did not respond within ${this.timeoutMs}ms: the request to ${this.url} timed out.`,
+          `Crispy did not respond within ${this.timeoutMs}ms: the request to ${this.safeUrl} timed out.`,
           "network",
         );
       }
       const reason = error instanceof Error ? error.message : String(error);
       throw new UpstreamError(
-        `Could not reach Crispy at ${this.url}: ${this.redact(reason)}`,
+        `Could not reach Crispy at ${this.safeUrl}: ${this.redact(reason)}`,
         "network",
       );
     } finally {
@@ -214,7 +223,9 @@ export class UpstreamClient {
       // A wrong CRISPY_MCP_URL, a bad deploy and a genuinely dropped session
       // all look like this. The advice is right for the common case, but the
       // status has to survive or a misrouted endpoint is undiagnosable.
-      const status = `HTTP ${response.status} ${response.statusText}`.trim();
+      const status = this.redact(
+        `HTTP ${response.status} ${response.statusText}`.trim(),
+      );
       return new UpstreamError(
         [
           `The Crispy session expired: ${status} -- the server no longer recognises this session id.`,
@@ -241,8 +252,9 @@ export class UpstreamClient {
     }
 
     return new UpstreamError(
-      `Crispy returned HTTP ${response.status} ${response.statusText}`.trim() +
-        (body === "" ? "" : `: ${body}`),
+      this.redact(
+        `Crispy returned HTTP ${response.status} ${response.statusText}`.trim(),
+      ) + (body === "" ? "" : `: ${body}`),
       "http",
     );
   }

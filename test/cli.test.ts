@@ -173,52 +173,64 @@ function fakeCrispy(sessionId: string) {
 }
 
 describe("crispy-mcp shutdown", () => {
-  it("ends the Crispy session with a DELETE before it exits on SIGTERM", async () => {
-    const crispy = fakeCrispy("sess-cli-1");
-    const url = await crispy.listen();
+  // Both signals are registered, so both are exercised. Ctrl+C is the one a
+  // human actually sends, and it is the one that was never covered.
+  it.each(["SIGINT", "SIGTERM"] as const)(
+    "ends the Crispy session with a DELETE before it exits on %s",
+    async (signal) => {
+      const crispy = fakeCrispy(`sess-cli-${signal}`);
+      const url = await crispy.listen();
 
-    const child = spawn(process.execPath, [BIN], {
-      env: { PATH: process.env.PATH ?? "", CRISPY_API_KEY: KEY, CRISPY_MCP_URL: url },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    try {
-      const initialized = new Promise<void>((resolve) => {
-        child.stdout.setEncoding("utf8");
-        child.stdout.on("data", (chunk: string) => {
-          if (chunk.includes("protocolVersion")) {
-            resolve();
-          }
-        });
+      const child = spawn(process.execPath, [BIN], {
+        env: {
+          PATH: process.env.PATH ?? "",
+          CRISPY_API_KEY: KEY,
+          CRISPY_MCP_URL: url,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
       });
 
-      child.stdin.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "initialize",
-          params: {
-            protocolVersion: "2025-06-18",
-            capabilities: {},
-            clientInfo: { name: "test", version: "0.0.0" },
-          },
-        })}\n`,
-      );
-      await initialized;
+      try {
+        const initialized = new Promise<void>((resolve) => {
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            if (chunk.includes("protocolVersion")) {
+              resolve();
+            }
+          });
+        });
 
-      const exited = new Promise<void>((resolve) =>
-        child.on("close", () => resolve()),
-      );
-      child.kill("SIGTERM");
+        child.stdin.write(
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "test", version: "0.0.0" },
+            },
+          })}\n`,
+        );
+        await initialized;
 
-      expect(await crispy.waitForDelete(10_000)).toBe(true);
-      expect(crispy.deleted[0].headers["mcp-session-id"]).toBe("sess-cli-1");
-      expect(crispy.deleted[0].headers.authorization).toBe(`Bearer ${KEY}`);
+        const exited = new Promise<void>((resolve) =>
+          child.on("close", () => resolve()),
+        );
+        child.kill(signal);
 
-      await exited;
-    } finally {
-      child.kill("SIGKILL");
-      await crispy.close();
-    }
-  }, 20_000);
+        expect(await crispy.waitForDelete(10_000)).toBe(true);
+        expect(crispy.deleted[0].headers["mcp-session-id"]).toBe(
+          `sess-cli-${signal}`,
+        );
+        expect(crispy.deleted[0].headers.authorization).toBe(`Bearer ${KEY}`);
+
+        await exited;
+      } finally {
+        child.kill("SIGKILL");
+        await crispy.close();
+      }
+    },
+    20_000,
+  );
 });

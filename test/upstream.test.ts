@@ -328,6 +328,78 @@ describe("UpstreamClient.send", () => {
 
     expect(error.message).not.toContain(KEY);
   });
+
+  it("never puts the api key in an error message when it is in the status line", async () => {
+    const { fetchImpl } = recordingFetch(
+      new Response(null, { status: 500, statusText: `rejected ${KEY}` }),
+    );
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.kind).toBe("http");
+    expect(error.message).not.toContain(KEY);
+    expect(error.message).toContain("[redacted]");
+  });
+
+  // CRISPY_MCP_URL is user-supplied and unrestricted. An endpoint that carries
+  // the key in a query component turns every message that names the url into a
+  // leak -- onto stderr and into the JSON-RPC error the client is handed.
+  describe("when the endpoint url itself carries the api key", () => {
+    const LEAKY_URL = `https://crispy.test/api/mcp?api_key=${KEY}`;
+
+    it("keeps the key out of the network-failure message", async () => {
+      const fetchImpl = (async () => {
+        throw new TypeError("fetch failed: ECONNREFUSED");
+      }) as unknown as typeof fetch;
+      const client = new UpstreamClient({
+        url: LEAKY_URL,
+        apiKey: KEY,
+        fetchImpl,
+      });
+
+      const error = (await client
+        .send(TOOL_CALL)
+        .catch((e: unknown) => e)) as UpstreamError;
+
+      expect(error.kind).toBe("network");
+      expect(error.message).not.toContain(KEY);
+      // The endpoint still has to be identifiable, or the error is useless.
+      expect(error.message).toContain("https://crispy.test/api/mcp");
+      expect(error.message).toContain("[redacted]");
+    });
+
+    it("keeps the key out of the timeout message", async () => {
+      const fetchImpl = (async (
+        _input: unknown,
+        init?: RequestInit,
+      ): Promise<Response> => {
+        const signal = init?.signal as AbortSignal | undefined;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        });
+      }) as unknown as typeof fetch;
+      const client = new UpstreamClient({
+        url: LEAKY_URL,
+        apiKey: KEY,
+        fetchImpl,
+        timeoutMs: 20,
+      });
+
+      const error = (await client
+        .send(TOOL_CALL)
+        .catch((e: unknown) => e)) as UpstreamError;
+
+      expect(error.message).toMatch(/timed out/i);
+      expect(error.message).not.toContain(KEY);
+      expect(error.message).toContain("https://crispy.test/api/mcp");
+      expect(error.message).toContain("[redacted]");
+    });
+  });
 });
 
 describe("UpstreamClient.endSession", () => {
@@ -344,7 +416,7 @@ describe("UpstreamClient.endSession", () => {
     return { client, calls };
   }
 
-  it("sends DELETE with the session id and the bearer token", async () => {
+  it("sends DELETE with the session id, the bearer token and the protocol version", async () => {
     const { client, calls } = await clientWithSession([
       new Response(null, { status: 204 }),
     ]);
@@ -357,6 +429,9 @@ describe("UpstreamClient.endSession", () => {
     const headers = new Headers(calls[1].init.headers as HeadersInit);
     expect(headers.get("mcp-session-id")).toBe("sess-live");
     expect(headers.get("authorization")).toBe(`Bearer ${KEY}`);
+    // The spec asks for the negotiated version on every request after
+    // initialize, and the DELETE is one of them.
+    expect(headers.get("mcp-protocol-version")).toBe("2025-06-18");
   });
 
   it("forgets the session so a second teardown sends nothing", async () => {
@@ -412,11 +487,18 @@ describe("UpstreamClient.endSession", () => {
   });
 
   it("accepts a 405 from a server that does not support teardown", async () => {
-    const { client } = await clientWithSession([
+    const { client, calls } = await clientWithSession([
       new Response("Method Not Allowed", { status: 405 }),
     ]);
 
     await expect(client.endSession()).resolves.toBeUndefined();
+
+    // Swallowing the 405 is the point -- but it has to be swallowed *after*
+    // asking. A teardown that never sends the DELETE also never throws.
+    expect(calls).toHaveLength(2);
+    expect(calls[1].url).toBe(URL);
+    expect(calls[1].init.method).toBe("DELETE");
+    expect(sessionIdOf(calls[1].init)).toBe("sess-live");
   });
 
   it("bounds the teardown so a hung DELETE cannot wedge exit", async () => {

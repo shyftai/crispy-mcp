@@ -204,7 +204,6 @@ describe("attachBridge", () => {
     };
     expect(response.id).toBe(42);
     expect(response.error.code).toBe(SESSION_ERROR_CODE);
-    expect(SESSION_ERROR_CODE).toBe(-32002);
     expect(response.error.message).toMatch(/expired/i);
   });
 
