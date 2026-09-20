@@ -36,6 +36,7 @@ async function main(): Promise<void> {
   const upstream = new UpstreamClient({
     url: config.url,
     apiKey: config.apiKey,
+    unsafeErrorDetail: config.unsafeErrorDetail,
   });
   const transport = new StdioServerTransport();
 

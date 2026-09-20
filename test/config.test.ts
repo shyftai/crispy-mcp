@@ -73,4 +73,49 @@ describe("resolveConfig", () => {
   it("rejects --api-key with no value", () => {
     expect(() => resolveConfig(["--api-key"], {})).toThrow(ConfigError);
   });
+
+  /**
+   * ACCEPTED 2. The bridge shows a failed request's status code and the body's
+   * byte length and nothing else, because no upstream-chosen string may enter a
+   * message. This buys the diagnostic back for somebody who has decided the
+   * risk is theirs to take. It is off unless the value is exactly `1`: a flag
+   * that any truthy string enables is a flag that gets enabled by accident.
+   */
+  describe("CRISPY_MCP_UNSAFE_ERROR_DETAIL", () => {
+    it("is off when the variable is absent", () => {
+      const config = resolveConfig([], { CRISPY_API_KEY: KEY });
+
+      expect(config.unsafeErrorDetail).toBe(false);
+    });
+
+    it("is on for exactly 1", () => {
+      const config = resolveConfig([], {
+        CRISPY_API_KEY: KEY,
+        CRISPY_MCP_UNSAFE_ERROR_DETAIL: "1",
+      });
+
+      expect(config.unsafeErrorDetail).toBe(true);
+    });
+
+    it("tolerates surrounding whitespace around the 1", () => {
+      const config = resolveConfig([], {
+        CRISPY_API_KEY: KEY,
+        CRISPY_MCP_UNSAFE_ERROR_DETAIL: " 1 ",
+      });
+
+      expect(config.unsafeErrorDetail).toBe(true);
+    });
+
+    it.each(["true", "yes", "on", "0", "TRUE", "2", "1 1", "01", ""])(
+      "stays off for %j",
+      (value) => {
+        const config = resolveConfig([], {
+          CRISPY_API_KEY: KEY,
+          CRISPY_MCP_UNSAFE_ERROR_DETAIL: value,
+        });
+
+        expect(config.unsafeErrorDetail).toBe(false);
+      },
+    );
+  });
 });

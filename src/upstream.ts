@@ -33,6 +33,26 @@ export const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
  */
 export const DEFAULT_BODY_READ_TIMEOUT_MS = 2_000;
 
+/**
+ * The absolute ceilings on a body read, and they are a different job from
+ * DEFAULT_TIMEOUT_MS.
+ *
+ * The gap bound rearms on every chunk, which is right for detecting a stall and
+ * useless against a wedge: a server dripping one byte inside every gap window
+ * keeps send() pending for as long as it likes while the body piles up in
+ * memory. Neither of these rearms. Exceeding either fails closed.
+ *
+ * Ten minutes and 64 MiB are chosen to be unreachable by anything Crispy
+ * legitimately sends. A tool result is JSON headed for a model's context
+ * window, so it is kilobytes; the largest plausible one -- a full export --
+ * is single-digit megabytes, and arrives in seconds. Both ceilings leave
+ * three orders of magnitude of headroom over that, and both are far enough
+ * above the 120-second gap bound that a healthy slow response hits neither.
+ */
+export const DEFAULT_MAX_BODY_MS = 600_000;
+
+export const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
+
 export type UpstreamErrorKind =
   | "auth"
   | "http"
@@ -58,65 +78,66 @@ export interface UpstreamOptions {
   timeoutMs?: number;
   teardownTimeoutMs?: number;
   bodyReadTimeoutMs?: number;
+  maxBodyMs?: number;
+  maxBodyBytes?: number;
+  /**
+   * Lets a message quote the body of a failed response. Off unless the
+   * operator set CRISPY_MCP_UNSAFE_ERROR_DETAIL=1; see config.ts and the
+   * README. Off is the invariant below; on is an operator's own risk.
+   */
+  unsafeErrorDetail?: boolean;
 }
 
 /**
- * Subtraction is sound on a string WE originate and never on a string an
- * upstream chooses.
+ * THE INVARIANT: no upstream-chosen bytes reach a message.
  *
- * Everything below this line is the sink for our own strings: the platform's
- * wording (undici quotes our url back at us) and the url itself. We know what
- * is in them, so removing a secret from them leaves something meaningful.
+ * No string whose CONTENT an upstream picks may appear in an error message, on
+ * stderr, or in a JSON-RPC error -- not the response body, not one field lifted
+ * out of it, not the reason phrase. A message is CONSTRUCTED out of four
+ * trusted parts and nothing else:
  *
- * An upstream body gets the opposite treatment -- see detailFrom(). Three
- * rounds of hardening a redactor against attacker-chosen bytes found a new
- * encoding every time, because subtraction inside text somebody else wrote is
- * a game the writer always moves last in. Messages are CONSTRUCTED out of
- * allowed parts instead, so there is nothing left to defeat.
+ *   - the numeric HTTP status, which is a number we read rather than text
+ *     somebody composed;
+ *   - the byte length of the body;
+ *   - our own fixed wording;
+ *   - the endpoint, already reduced by endpointForMessage().
+ *
+ * So `Crispy returned HTTP 500: <54 bytes, not shown>` and no more than that.
+ *
+ * Five rounds tried to make the opposite approach work and each one shipped the
+ * next encoding's bug. Round 4 subtracted the key out of the body; round 5
+ * subtracted it out of the decoded body; round 6 fixed the order of cutting and
+ * scrubbing; round 7 gave up on subtraction and admitted one JSON field by a
+ * character class -- plain printable ascii, no `%`, no 16-character run of the
+ * key. Base64, hex and `&#65;` are all plain printable ascii, and `&#65;` splits
+ * a run into 15-character pieces. A character class is a blacklist wearing
+ * different clothes: ANY string an upstream chooses can encode a credential in
+ * SOME printable form, and that set cannot be enumerated. Stop trying.
+ *
+ * This is closed because the code path does not exist, not because a filter is
+ * clever. There is nothing left here to out-encode.
+ *
+ * SUBTRACTION SURVIVES IN EXACTLY ONE PLACE. strip() below is still used on
+ * strings WE originate: the platform's own wording, which quotes our url back
+ * at us ("Failed to parse URL from <the raw url>"), and the url itself. We know
+ * what is in those, so removing a secret from them leaves something meaningful,
+ * and the writer of the text is not the attacker. Nothing else may use it --
+ * with one advertised exception, the CRISPY_MCP_UNSAFE_ERROR_DETAIL escape
+ * hatch, where it runs as declared best effort and the README says so.
  */
 
 /** What a message is allowed to show of a string we originate. */
 const MAX_PLATFORM_REASON = 500;
 
 /**
- * What a message is allowed to show of the one field lifted out of an upstream
- * body. A Crispy error sentence sits well inside this; the cap is here because
- * the field crossed the wire and an upstream can say anything.
+ * What CRISPY_MCP_UNSAFE_ERROR_DETAIL=1 is allowed to show of a body. The cap
+ * is not a safety property -- nothing about that path is -- it just keeps a
+ * megabyte of html out of a client's error field.
  */
-const MAX_UPSTREAM_DETAIL = 300;
+const MAX_UNSAFE_DETAIL = 1_000;
 
-/**
- * The shortest run of a secret that is worth hiding on its own.
- *
- * F1 and F3 were both "63 characters of a 64-character key reach the message".
- * Checking for the whole key only would hand the same prefix back the moment an
- * upstream echoed a truncated one -- and truncating a credential before logging
- * it is what a careful server does, so this is the likely case, not the exotic
- * one. Sixteen characters is long enough not to fire on a shared key prefix
- * like `sk-live-`, which any body explaining the key format will contain.
- */
-const MIN_SECRET_RUN = 16;
-
-/** The reason phrase is bounded by the HTTP grammar. Bound it here too. */
-const MAX_STATUS_TEXT = 80;
-
-/** How much of a failed response's body is kept to look for that one field. */
+/** How much of a failed response's body is read at all, to count and to quote. */
 const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
-
-/**
- * Plain printable ascii, minus `%`.
- *
- * What passes this class cannot be a percent escape, a control sequence a
- * terminal will act on, a bidi override, or a homoglyph. That is what makes the
- * secret check in carriesSecret() sound where a redactor was not: inside this
- * class the only reading left for a credential to hide under is form-encoding's
- * `+` for a space, and that is one line to cover rather than an open list.
- *
- * A field that fails the class is dropped whole. It is not sanitised: sanitising
- * is what leaves a remainder, and every bug the last three rounds found lived in
- * a remainder.
- */
-const PLAIN_TEXT = /^[ -$&-~]+$/;
 
 const REDACTED = "[redacted]";
 
@@ -252,22 +273,6 @@ function redactSpans(text: string, spans: Span[]): string {
   return out + text.slice(cursor);
 }
 
-/**
- * Every window of `secret` long enough to be worth hiding on its own, so that
- * finding one of them is finding the secret. A secret no longer than the window
- * is its own only window.
- */
-function runsOf(secret: string): readonly string[] {
-  if (secret.length <= MIN_SECRET_RUN) {
-    return [secret];
-  }
-  const runs: string[] = [];
-  for (let at = 0; at + MIN_SECRET_RUN <= secret.length; at += 1) {
-    runs.push(secret.slice(at, at + MIN_SECRET_RUN));
-  }
-  return runs;
-}
-
 /** Dedupes and drops the empty string. Order is irrelevant: spans are merged. */
 function secretsOf(...secrets: string[]): readonly string[] {
   return [...new Set(secrets.filter((secret) => secret !== ""))];
@@ -314,37 +319,6 @@ function strip(text: string, secrets: readonly string[]): string {
   return redactSpans(text, hits);
 }
 
-/** The one field a message may quote out of a JSON error body, or nothing. */
-function errorFieldOf(text: string): string | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text) as unknown;
-  } catch {
-    return undefined;
-  }
-
-  if (typeof parsed !== "object" || parsed === null) {
-    return undefined;
-  }
-
-  // OBSERVED 2026-09-20, POST https://crispy.sh/api/mcp with a bad bearer:
-  // {"error":"Invalid API key. ...","retryable":false,"suggestion":"..."}.
-  // The same endpoint also speaks JSON-RPC, whose error is an object with a
-  // message. Those are the two shapes of one field, not two fields.
-  const error = (parsed as { error?: unknown }).error;
-  if (typeof error === "string") {
-    return error;
-  }
-  if (typeof error === "object" && error !== null) {
-    const message = (error as { message?: unknown }).message;
-    if (typeof message === "string") {
-      return message;
-    }
-  }
-
-  return undefined;
-}
-
 /** Joins what was retained of a body. */
 function concatenate(chunks: readonly Uint8Array[], total: number): Uint8Array {
   const out = new Uint8Array(total);
@@ -356,14 +330,23 @@ function concatenate(chunks: readonly Uint8Array[], total: number): Uint8Array {
   return out;
 }
 
+/** Which bound ended a read before the body did. */
+type BodyLimit = "gap" | "duration" | "bytes";
+
 /** What a bounded read of a response body came back with. */
 interface BodyRead {
   /** What was retained, decoded. Not necessarily the whole body. */
   text: string;
   /** Byte length of everything that arrived, retained or not. */
   bytes: number;
-  /** False if the read hit its deadline or its retention cap. */
+  /** False if the read hit a bound or its retention cap. */
   complete: boolean;
+  /**
+   * The bound that ended the read, if one did. Undefined when the body simply
+   * finished -- including when it finished but was retained only in part, which
+   * is what the error path does on purpose.
+   */
+  limit?: BodyLimit;
 }
 
 export class UpstreamClient {
@@ -385,12 +368,13 @@ export class UpstreamClient {
   /** Everything that may not appear in a message. */
   private readonly secrets: readonly string[];
 
-  /** The runs of those secrets that carriesSecret() rejects a string for. */
-  private readonly secretRuns: readonly string[];
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly teardownTimeoutMs: number;
   private readonly bodyReadTimeoutMs: number;
+  private readonly maxBodyMs: number;
+  private readonly maxBodyBytes: number;
+  private readonly unsafeErrorDetail: boolean;
 
   private sessionId: string | undefined;
   private protocolVersion: string | undefined;
@@ -427,13 +411,15 @@ export class UpstreamClient {
       ...(this.safeUrl === options.url ? [] : [options.url]),
       options.apiKey,
     );
-    this.secretRuns = this.secrets.flatMap((secret) => runsOf(secret));
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.teardownTimeoutMs =
       options.teardownTimeoutMs ?? DEFAULT_TEARDOWN_TIMEOUT_MS;
     this.bodyReadTimeoutMs =
       options.bodyReadTimeoutMs ?? DEFAULT_BODY_READ_TIMEOUT_MS;
+    this.maxBodyMs = options.maxBodyMs ?? DEFAULT_MAX_BODY_MS;
+    this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+    this.unsafeErrorDetail = options.unsafeErrorDetail ?? false;
   }
 
   /**
@@ -463,80 +449,56 @@ export class UpstreamClient {
   }
 
   /**
-   * Whether a string that has already passed PLAIN_TEXT carries a secret.
+   * All an upstream body contributes to a message: how many bytes of it there
+   * were. Not a word of its content -- see THE INVARIANT at the top of this
+   * file. The size is ours: we counted it, the upstream did not compose it.
    *
-   * This is a rejection, not a subtraction: the caller drops the whole string.
-   * That is the difference from the redactor this replaces -- a redactor keeps
-   * a remainder and every round found a new way to get something into it,
-   * whereas there is no remainder here to get wrong. The class check has ruled
-   * out percent escapes already, so the only reading left that a credential
-   * could hide under is form-encoding's `+` for a space.
-   *
-   * A long enough RUN of a secret is treated as the secret; see MIN_SECRET_RUN.
+   * A size is a weak diagnostic and that is the point of the escape hatch
+   * below, not a reason to soften this. Whether a particular string is safe to
+   * quote is exactly the question five rounds of filters got wrong, so this
+   * one does not ask it.
    */
-  private carriesSecret(text: string): boolean {
-    const readings = [text, text.replaceAll("+", " ")];
-    return this.secretRuns.some((run) =>
-      readings.some((reading) => reading.includes(run)),
-    );
-  }
-
-  /**
-   * The ONLY thing an upstream body may contribute to a message.
-   *
-   * No raw body text reaches a message. One field is lifted out of a JSON body
-   * -- see errorFieldOf() -- and it is kept only if it parses, only if it is
-   * plain printable text, and only if it carries no secret. Anything else is a
-   * byte count and nothing more: unparseable, wrong shape, binary, truncated,
-   * over-long.
-   *
-   * The checks run on the WHOLE field and the cut comes last. Capping first and
-   * checking the cap is round 6's bug wearing a new hat: a key straddling the
-   * cap would lose its tail and the prefix would sail through the check.
-   */
-  private detailFrom(read: BodyRead): string {
+  private bodyDetail(read: BodyRead): string {
     if (read.bytes === 0) {
       return "";
     }
 
     const unshown = `<${read.bytes} bytes, not shown>`;
-    if (!read.complete) {
+    if (!this.unsafeErrorDetail) {
       return unshown;
     }
 
-    const field = errorFieldOf(read.text.trim())?.trim();
-    if (
-      field === undefined ||
-      !PLAIN_TEXT.test(field) ||
-      this.carriesSecret(field)
-    ) {
+    // Past this line is the CRISPY_MCP_UNSAFE_ERROR_DETAIL=1 path, and the
+    // invariant above does not hold on it. That is what the operator asked
+    // for. strip() runs as BEST EFFORT and nothing more: it catches an upstream
+    // that reflects the key back verbatim, and it is defeated by any of the
+    // encodings in this file's history. The README says so in those words.
+    if (!read.complete || read.text.trim() === "") {
       return unshown;
     }
 
-    return field.length > MAX_UPSTREAM_DETAIL
-      ? `${field.slice(0, MAX_UPSTREAM_DETAIL)}...`
-      : field;
+    const scrubbed = strip(read.text.trim(), this.secrets);
+    return scrubbed.length > MAX_UNSAFE_DETAIL
+      ? `${scrubbed.slice(0, MAX_UNSAFE_DETAIL)}...`
+      : scrubbed;
   }
 
   /**
-   * `HTTP <code>`, plus the reason phrase when the wire sent one we are willing
-   * to repeat. The code is a number and it is ours; the phrase crossed the wire,
-   * so it gets the same class check and the same all-or-nothing drop the body
-   * field gets. A misrouted endpoint is undiagnosable without the code, so the
-   * code survives whatever happens to the phrase.
+   * `HTTP <code>`, and never anything else.
+   *
+   * The reason phrase used to ride along behind a character class. It crossed
+   * the wire and an upstream picks it, so it is the same class as the body, and
+   * R6 showed that is not theoretical: a 15-character half in the phrase and a
+   * 15-character half in the body reassembled a 30-character key across the
+   * `: ` between them, with neither half long enough to trip a 16-character
+   * window. Both halves lost their ride at once when this stopped reading
+   * statusText at all.
+   *
+   * The code stays because a misrouted endpoint is undiagnosable without it,
+   * and because a number we read is not text somebody composed.
    */
   private statusLine(response: Response): string {
-    const phrase = response.statusText.trim();
-    const shown =
-      phrase === "" || !PLAIN_TEXT.test(phrase) || this.carriesSecret(phrase)
-        ? ""
-        : phrase.length > MAX_STATUS_TEXT
-          ? `${phrase.slice(0, MAX_STATUS_TEXT)}...`
-          : phrase;
-
-    return shown === ""
-      ? `HTTP ${response.status}`
-      : `HTTP ${response.status} ${shown}`;
+    return `HTTP ${response.status}`;
   }
 
   /**
@@ -775,7 +737,7 @@ export class UpstreamClient {
       this.invalidateSession();
     }
 
-    const body = this.detailFrom(await this.safeRead(response));
+    const body = this.bodyDetail(await this.safeRead(response));
     const status = this.statusLine(response);
 
     if (expired) {
@@ -877,6 +839,15 @@ export class UpstreamClient {
    * stops arriving is. On the error path it is the whole read, because that
    * body is a diagnostic nicety and no caller waiting for an answer should pay
    * more than a moment for one.
+   *
+   * Two ABSOLUTE ceilings sit alongside it and neither of them rearms. The gap
+   * bound is a stall detector, and a stall is not the only way to wedge a
+   * read: a server dripping one byte inside every gap window rearms the bound
+   * for ever, so send() stays pending and the body accumulates in memory with
+   * nothing to stop it. DEFAULT_MAX_BODY_MS bounds the wall clock and
+   * DEFAULT_MAX_BODY_BYTES bounds the total that arrived, retained or not. Each
+   * fails closed and says which one bit, so a legitimate response that somehow
+   * reaches one is diagnosable rather than mysterious.
    */
   private async readBounded(
     response: Response,
@@ -891,15 +862,19 @@ export class UpstreamClient {
     }
 
     const reader = stream.getReader();
-    let expired = false;
+    let limit: BodyLimit | undefined;
+    const stop = (which: BodyLimit): void => {
+      limit ??= which;
+      void reader.cancel().catch(() => undefined);
+    };
+
     let timer: ReturnType<typeof setTimeout> | undefined;
     const arm = (): void => {
       clearTimeout(timer);
-      timer = setTimeout(() => {
-        expired = true;
-        void reader.cancel().catch(() => undefined);
-      }, bound.ms);
+      timer = setTimeout(() => stop("gap"), bound.ms);
     };
+    // Armed once and never rearmed. That is the whole difference from arm().
+    const ceiling = setTimeout(() => stop("duration"), this.maxBodyMs);
 
     const chunks: Uint8Array[] = [];
     let bytes = 0;
@@ -921,6 +896,13 @@ export class UpstreamClient {
             chunks.push(kept);
             retained += kept.byteLength;
           }
+          // Counted against everything that ARRIVED, not against what was
+          // retained: the error path retains 64 KiB, and a ceiling on that
+          // would bound nothing a flood has to get past.
+          if (bytes > this.maxBodyBytes) {
+            stop("bytes");
+            break;
+          }
           if (bound.perChunk) {
             arm();
           }
@@ -928,12 +910,14 @@ export class UpstreamClient {
       }
     } finally {
       clearTimeout(timer);
+      clearTimeout(ceiling);
     }
 
     return {
       text: UTF8.decode(concatenate(chunks, retained)),
       bytes,
-      complete: !expired && retained === bytes,
+      complete: limit === undefined && retained === bytes,
+      limit,
     };
   }
 
@@ -975,11 +959,12 @@ export class UpstreamClient {
     // is the wedge an expired session used to cause, reached through a
     // different door, and shipping a wedge inside the fix for a wedge is not
     // acceptable.
+    //
+    // Each bound gets its own wording, because "the body went quiet" is a wrong
+    // and misleading thing to tell somebody whose server was in fact sending
+    // busily the whole time. Not one of these quotes a byte of the body.
     if (!read.complete) {
-      throw new UpstreamError(
-        `Crispy stopped sending the response: the body from ${this.safeUrl} went quiet for ${this.timeoutMs}ms, so the read was abandoned.`,
-        "network",
-      );
+      throw new UpstreamError(this.abandonedBodyMessage(read), "network");
     }
 
     const text = read.text;
@@ -1003,11 +988,23 @@ export class UpstreamClient {
       return JSON.parse(text) as unknown;
     } catch {
       // Constructed, not scrubbed: this is an upstream body, so nothing of it
-      // enters the message but its size. See detailFrom().
+      // enters the message but its size. See bodyDetail().
       throw new UpstreamError(
-        `Crispy returned a response that is not JSON: <${read.bytes} bytes, not shown>`,
+        `Crispy returned a response that is not JSON: ${this.bodyDetail(read)}`,
         "protocol",
       );
+    }
+  }
+
+  /** Why a body read was abandoned. Built from the bound, never from the body. */
+  private abandonedBodyMessage(read: BodyRead): string {
+    switch (read.limit) {
+      case "duration":
+        return `Crispy's response did not finish within ${this.maxBodyMs}ms: the body from ${this.safeUrl} was still arriving at the absolute limit, so the read was abandoned.`;
+      case "bytes":
+        return `Crispy's response grew past ${this.maxBodyBytes} bytes: the body from ${this.safeUrl} exceeded the absolute limit, so the read was abandoned.`;
+      default:
+        return `Crispy stopped sending the response: the body from ${this.safeUrl} went quiet for ${this.timeoutMs}ms, so the read was abandoned.`;
     }
   }
 }

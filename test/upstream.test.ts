@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { UpstreamClient, UpstreamError } from "../src/upstream";
+import {
+  DEFAULT_MAX_BODY_BYTES,
+  DEFAULT_MAX_BODY_MS,
+  DEFAULT_TIMEOUT_MS,
+  UpstreamClient,
+  UpstreamError,
+} from "../src/upstream";
 
 const KEY = "fake-test-key-do-not-leak";
 const URL = "https://crispy.test/api/mcp";
@@ -172,9 +178,15 @@ describe("UpstreamClient.send", () => {
     expect(error.kind).toBe("auth");
   });
 
-  it("reports other http failures with the status and body", async () => {
+  // ACCEPTED 1 took the body out of this message. What the upstream said used
+  // to be quoted here; now the status and the byte count are the message.
+  it("reports other http failures with the status and the body's size", async () => {
+    const body = JSON.stringify({ error: "upstream exploded" });
     const { fetchImpl } = recordingFetch(
-      jsonResponse({ error: "upstream exploded" }, { status: 502 }),
+      new Response(body, {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      }),
     );
     const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
 
@@ -183,8 +195,9 @@ describe("UpstreamClient.send", () => {
       .catch((e: unknown) => e)) as UpstreamError;
 
     expect(error.kind).toBe("http");
-    expect(error.message).toContain("502");
-    expect(error.message).toContain("upstream exploded");
+    expect(error.message).toContain("HTTP 502");
+    expect(error.message).toContain(`<${Buffer.byteLength(body)} bytes, not shown>`);
+    expect(error.message).not.toContain("upstream exploded");
   });
 
   it("surfaces a network failure instead of hanging", async () => {
@@ -313,7 +326,9 @@ describe("UpstreamClient.send", () => {
 
     expect(error.kind).toBe("http");
     expect(error.message).toContain("404");
-    expect(error.message).toContain("no such endpoint");
+    // ACCEPTED 1: the body's content is gone, its size is not.
+    expect(error.message).not.toContain("no such endpoint");
+    expect(error.message).toContain("bytes, not shown");
   });
 
   // A replacement session is a new session. rememberProtocolVersion only
@@ -915,7 +930,9 @@ describe("UpstreamClient session fencing", () => {
     // A wrong CRISPY_MCP_URL 404s exactly like an expired session. The advice
     // stays, but the status has to survive or the misroute is invisible.
     expect(error.message).toContain("404");
-    expect(error.message).toContain("Not Found");
+    // ACCEPTED 1 retired the reason phrase: an upstream picks its text, so it
+    // is the same class as the body. The numeric code carries the diagnosis.
+    expect(error.message).not.toContain("Not Found");
   });
 });
 
@@ -1223,32 +1240,24 @@ describe("UpstreamClient message construction", () => {
     return error.message;
   }
 
-  describe("the one field a JSON error body is allowed to contribute", () => {
-    // OBSERVED 2026-09-20 against https://crispy.sh/api/mcp with a bad bearer:
-    // {"error":"Invalid API key. ...","retryable":false,"suggestion":"..."}.
-    it("quotes the error field the Crispy API actually returns", async () => {
-      const message = await messageFor(
-        jsonResponse(
-          { error: "Invalid API key. The key is unknown or revoked." },
-          { status: 500 },
-        ),
-      );
-
-      expect(message).toContain("Invalid API key. The key is unknown or revoked.");
-    });
-
-    // The same endpoint speaks JSON-RPC, whose error is an object.
-    it("quotes error.message out of a JSON-RPC error object", async () => {
-      const message = await messageFor(
-        jsonResponse(
-          { jsonrpc: "2.0", id: 7, error: { code: -32600, message: "bad request" } },
-          { status: 400 },
-        ),
-      );
-
-      expect(message).toContain("bad request");
-    });
-
+  /**
+   * ACCEPTED 1, round 8. This used to be "the one field a JSON error body is
+   * allowed to contribute", and the field was admitted by a character class.
+   * Base64, hex and `&#65;` all pass a plain-printable-ascii class, so the
+   * class admitted the key in three encodings nobody had listed. There is no
+   * admitted field any more. A body contributes its size.
+   *
+   * Retired with the field, each named where it is now answered:
+   *   - "quotes the error field the Crispy API actually returns" and "quotes
+   *     error.message out of a JSON-RPC error object": the quoting is the
+   *     finding. See "does not quote even a harmless error field" above, and
+   *     CRISPY_MCP_UNSAFE_ERROR_DETAIL for buying the diagnostic back.
+   *   - "keeps a field that merely names the key's format": that field is
+   *     dropped now too. The run check it exercised is gone.
+   *   - "checks the whole field before capping it" and "caps a clean but
+   *     over-long field": no field is kept, so there is no cap to get wrong.
+   */
+  describe("what a failed body contributes: its size and nothing else", () => {
     it("shows only a byte count when the body is not JSON", async () => {
       const message = await messageFor(
         new Response("<html>gateway down</html>", { status: 502 }),
@@ -1288,133 +1297,76 @@ describe("UpstreamClient message construction", () => {
       expect(message).toContain("<513 bytes, not shown>");
     });
 
-    it("shows only a byte count when the JSON has no error field", async () => {
+    /**
+     * One code path answers every one of these, which is the whole claim: the
+     * message never looks at the body, so what the body contains cannot matter.
+     * They are a table rather than a paragraph each because the reason they all
+     * pass is now the same reason, and writing them as eight independent
+     * arguments would suggest eight defences where there is one absence.
+     *
+     * Each was a separate defence once. The percent escape, the control
+     * character and the non-ascii text were what the character class caught;
+     * the key, the truncated key and the `+`-for-space key were what the run
+     * check caught; the html entities and the base64 are what neither caught.
+     */
+    it.each([
+      ["a plain sentence", "something went wrong"],
+      ["a percent escape", "rejected %73%65%63"],
+      ["a control sequence", "rejected\u001b[2Jcleared"],
+      ["non-ascii text", "rejected ‮rossim"],
+      ["the api key", `key ${KEY} is revoked`],
+      ["a truncated api key", `key ${KEY.slice(0, 20)} is revoked`],
+      ["html numeric refs", "AAAA&#65;AAAA"],
+      ["base64", `token ${Buffer.from(KEY, "utf8").toString("base64")}`],
+    ])("quotes nothing of a body carrying %s", async (_shape, text) => {
+      const body = JSON.stringify({ error: text });
       const message = await messageFor(
-        jsonResponse({ detail: "something went wrong" }, { status: 500 }),
+        new Response(body, {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
       );
 
-      expect(message).toContain("bytes, not shown");
+      // Bytes, not code units: the non-ascii case is two of them apart.
+      expect(message).toBe(
+        `Crispy returned HTTP 500: <${Buffer.byteLength(body)} bytes, not shown>`,
+      );
+    });
+
+    it("quotes nothing of a JSON body with no error field either", async () => {
+      const body = JSON.stringify({ detail: "something went wrong" });
+      const message = await messageFor(
+        new Response(body, {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
       expect(message).not.toContain("something went wrong");
+      expect(message).toContain(`<${Buffer.byteLength(body)} bytes, not shown>`);
     });
 
-    it("drops a field carrying a percent escape rather than decoding it", async () => {
+    it("drops a whole body whose key arrives with + for its spaces", async () => {
       const message = await messageFor(
-        jsonResponse({ error: "rejected %73%65%63" }, { status: 500 }),
-      );
-
-      expect(message).not.toContain("%73");
-      expect(message).not.toContain("rejected");
-      expect(message).toContain("bytes, not shown");
-    });
-
-    it("drops a field carrying a control character", async () => {
-      const message = await messageFor(
-        jsonResponse({ error: "rejected\u001b[2Jcleared" }, { status: 500 }),
-      );
-
-      expect(message).not.toContain("cleared");
-      expect(message).toContain("bytes, not shown");
-    });
-
-    it("drops a field carrying non-ascii text", async () => {
-      const message = await messageFor(
-        jsonResponse({ error: "rejected ‮rossim" }, { status: 500 }),
-      );
-
-      expect(message).not.toContain("rossim");
-      expect(message).toContain("bytes, not shown");
-    });
-
-    /**
-     * A real api key is plain ascii, so it passes the character class on its
-     * own merits. The class check is not the whole defence: the field is
-     * dropped WHOLE if it carries a secret. Dropping rather than subtracting is
-     * what makes this sound -- there is no surviving remainder to get the
-     * boundary wrong on, which is the bug every previous round found.
-     */
-    it("drops the whole field when the upstream echoes the api key", async () => {
-      const message = await messageFor(
-        jsonResponse({ error: `key ${KEY} is revoked` }, { status: 500 }),
-      );
-
-      expect(message).not.toContain(KEY);
-      expect(message).not.toContain("is revoked");
-      expect(message).toContain("bytes, not shown");
-    });
-
-    /**
-     * F1 and F3 were both "63 characters of a 64-character key reach the
-     * message". ACCEPTED 1 deleted the two paths that manufactured that prefix,
-     * but a whole-key check would hand the same prefix straight back the moment
-     * an upstream echoed a truncated key -- and truncating a credential before
-     * logging it is what a careful server does. So a long enough RUN of the key
-     * drops the field, not just the key entire.
-     */
-    it("drops the whole field when the upstream echoes a truncated key", async () => {
-      const message = await messageFor(
-        jsonResponse({ error: `key ${KEY.slice(0, 20)} is revoked` }, { status: 500 }),
-      );
-
-      expect(message).not.toContain(KEY.slice(0, 20));
-      expect(message).toContain("bytes, not shown");
-    });
-
-    // The run has to be long enough not to fire on a shared key PREFIX, or
-    // every body that explains the key format loses its diagnostic.
-    it("keeps a field that merely names the key's format", async () => {
-      const message = await messageFor(
-        jsonResponse(
-          { error: "Provide the key as: Authorization: Bearer sk-live-..." },
-          { status: 401 },
-        ),
-        { apiKey: "sk-live-0123456789abcdef0123456789ab" },
-      );
-
-      expect(message).toContain("Authorization: Bearer sk-live-...");
-    });
-
-    it("drops the whole field when the key arrives with + for its spaces", async () => {
-      const spaced = "sk live key";
-      const message = await messageFor(
-        jsonResponse({ error: `key sk+live+key is revoked` }, { status: 500 }),
-        { apiKey: spaced },
+        new Response(JSON.stringify({ error: "key sk+live+key is revoked" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+        { apiKey: "sk live key" },
       );
 
       expect(message).not.toContain("sk+live+key");
       expect(message).toContain("bytes, not shown");
     });
-
-    /**
-     * Check the whole field, then cut. Cutting first and checking the cut is
-     * the round-6 bug in a new place: a key straddling the cap would lose its
-     * tail and the prefix would survive the check.
-     */
-    it("checks the whole field before capping it", async () => {
-      const straddling = `${"n".repeat(295)}${KEY} and more`;
-      const message = await messageFor(
-        jsonResponse({ error: straddling }, { status: 500 }),
-      );
-
-      expect(message).not.toContain(KEY.slice(0, 20));
-      expect(message).toContain("bytes, not shown");
-    });
-
-    it("caps a clean but over-long field", async () => {
-      const message = await messageFor(
-        jsonResponse({ error: "q".repeat(4_000) }, { status: 500 }),
-      );
-
-      expect(message).toContain("...");
-      expect(message.length).toBeLessThan(500);
-    });
   });
 
   /**
    * The old sink answered this table by decoding the text and matching the
-   * decoded form, and round 7 found the double encoding that beat it. The
-   * construction answers it by not reading the text at all: six of these seven
-   * carry a `%` and fail the character class, and the seventh is the key
-   * itself. Nothing here is decoded, so there is no decoding to out-run.
+   * decoded form, and round 7 found the double encoding that beat it. Round 7's
+   * class answered it by refusing anything with a `%` in it, and round 8 found
+   * three encodings with no `%` in them. Neither the body nor the status line
+   * reads a byte of any of it now, so the table proves an absence rather than a
+   * filter -- which is why it can no longer be out-encoded.
    */
   describe("the construction does not care what encoding a credential wears", () => {
     it.each(FORMS)("drops a body field carrying %s", async (_form, encoded) => {
@@ -1440,57 +1392,42 @@ describe("UpstreamClient message construction", () => {
     });
   });
 
+  /**
+   * ACCEPTED 1 again. statusText crosses the wire and an upstream picks its
+   * text, so it is the body's class, not the status code's. R6 showed the cost
+   * of pretending otherwise: two 15-character halves, one in the phrase and one
+   * in the body field, reassembled a 30-character key across the `: ` joining
+   * them, with neither half long enough to trip a 16-character window.
+   *
+   * ACCEPTED 4 deleted "caps an over-long reason phrase" from here. It passed
+   * whether the phrase was capped or discarded entirely -- it asserted neither
+   * the retained prefix nor the ellipsis -- and ACCEPTED 1 retired the code it
+   * was written for, so there is no cap left for a sharper version to test.
+   */
   describe("the status line", () => {
-    it("keeps a normal reason phrase", async () => {
+    it.each([
+      ["a standard phrase", "Bad Gateway"],
+      ["the api key", `rejected ${KEY}`],
+      ["a percent escape", "rejected %73%65%63"],
+      ["an over-long phrase", "w".repeat(400)],
+      ["html numeric refs", "AAAA&#65;AAAA"],
+    ])("keeps nothing of %s", async (_shape, phrase) => {
+      const message = await messageFor(
+        new Response(null, { status: 500, statusText: phrase }),
+      );
+
+      expect(message).toBe("Crispy returned HTTP 500");
+    });
+
+    it("keeps the status code, which is a number we read", async () => {
       const message = await messageFor(
         new Response(null, { status: 502, statusText: "Bad Gateway" }),
       );
 
-      expect(message).toContain("HTTP 502 Bad Gateway");
-    });
-
-    it("drops a reason phrase carrying the api key and keeps the status", async () => {
-      const message = await messageFor(
-        new Response(null, { status: 500, statusText: `rejected ${KEY}` }),
-      );
-
-      expect(message).not.toContain(KEY);
-      expect(message).not.toContain("rejected");
-      expect(message).toContain("HTTP 500");
-    });
-
-    it("drops a reason phrase carrying a percent escape", async () => {
-      const message = await messageFor(
-        new Response(null, { status: 500, statusText: "rejected %73%65%63" }),
-      );
-
-      expect(message).not.toContain("%73");
-      expect(message).toContain("HTTP 500");
-    });
-
-    // No `%` to fail the class on, so the class is not what catches this: a
-    // form-encoded space is the one reading left inside plain ascii.
-    it("drops a reason phrase carrying the key with + for its spaces", async () => {
-      const message = await messageFor(
-        new Response(null, { status: 500, statusText: "rejected sk+live+key" }),
-        { apiKey: "sk live key" },
-      );
-
-      expect(message).not.toContain("sk+live+key");
-      expect(message).toContain("HTTP 500");
-    });
-
-    it("caps an over-long reason phrase", async () => {
-      const message = await messageFor(
-        new Response(null, { status: 500, statusText: "w".repeat(400) }),
-      );
-
-      expect(message).not.toContain("w".repeat(200));
-      expect(message).toContain("HTTP 500");
+      expect(message).toContain("HTTP 502");
     });
   });
 
-  /** The three findings the construction deletes rather than defends. */
   describe("the findings this design retires", () => {
     it("F1: a key repeated past the old 64-KiB scrub bound leaks nothing", async () => {
       const key = "k".repeat(64);
@@ -1685,10 +1622,15 @@ describe("UpstreamClient body reading", () => {
   /**
    * The bound is on the gap between chunks, not on the whole read. A total
    * bound generous enough for a large slow tool result would be too generous to
-   * bound a wedge; a gap bound is both. This body takes 5x the bound in total
-   * and must not be cut off.
+   * bound a wedge; a gap bound is both.
+   *
+   * ACCEPTED 4. This sent about fifty bytes and called them "a large response",
+   * so a one-kilobyte retention cap would have kept it green and it proved only
+   * that the gap bound rearms. It now carries a megabyte, over twenty chunks,
+   * taking five times the gap bound in total: it bites on the retention cap and
+   * on the byte ceiling as well as on the gap bound.
    */
-  it("does not cut off a large response that keeps arriving", async () => {
+  it("does not cut off a megabyte arriving over many gap windows", async () => {
     const slow = scriptedBody();
     const { fetchImpl } = recordingFetch(
       new Response(slow.body, {
@@ -1704,18 +1646,25 @@ describe("UpstreamClient body reading", () => {
     });
 
     const pending = client.send(TOOL_CALL);
-    const payload = JSON.stringify({ jsonrpc: "2.0", id: 7, result: { ok: true } });
-    for (const character of payload) {
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      slow.push(character);
+    const filler = "z".repeat(1024 * 1024);
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      result: { ok: true, filler },
+    });
+    const chunk = Math.ceil(payload.length / 20);
+    for (let at = 0; at < payload.length; at += chunk) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      slow.push(payload.slice(at, at + chunk));
     }
     slow.close();
 
-    await expect(pending).resolves.toEqual({
-      jsonrpc: "2.0",
-      id: 7,
-      result: { ok: true },
-    });
+    const body = (await pending) as {
+      result: { ok: boolean; filler: string };
+    };
+    expect(body.result.ok).toBe(true);
+    expect(body.result.filler).toHaveLength(1024 * 1024);
+    expect(payload.length).toBeGreaterThan(1024 * 1024);
   });
 
   it("cancels the stream of an error body that never finishes", async () => {
@@ -1815,5 +1764,484 @@ describe("UpstreamClient platform-error sanitising", () => {
 
     expect(message).not.toContain("sk-live");
     expect(message).toContain("[redacted]");
+  });
+});
+
+/**
+ * Round 8. Round 7 replaced subtraction with an allowlist: a JSON `error` field
+ * was admitted if it matched a plain-printable-ascii class and carried no
+ * 16-character run of a secret. That killed percent-encoding and nothing else.
+ *
+ * Reproduced against the built dist at ca061db, every one of these put the key
+ * into `error.message` in a form one `base64 -d` recovers:
+ *
+ *   R1 html numeric refs  AAAAAAAAAAAAAAA&#65;AAAAAAAAAAAAAAA...
+ *   R2 base64             token QUFBQUFBQUFBQUFB...
+ *   R3 hex                token 41414141414141...
+ *   R4 realistic key      auth failed for c2stbGl2ZS03ZjNhOWMyZThiMWQ0ZjZhMGM1ZTJiOWQ=
+ *   R6 split              HTTP 500 AAAAAAAAAAAAAAA: BBBBBBBBBBBBBBB
+ *
+ * Base64, hex and `&#65;` are all plain printable ascii, and `&#65;` splitting a
+ * run into 15-character pieces defeats a 16-character window. That is the fifth
+ * distinct encoding to beat the same check in five rounds. A character class is
+ * a blacklist in different clothes: any string an upstream chooses can encode a
+ * credential in SOME printable form, and that set cannot be enumerated.
+ *
+ * So the rule is now positional, not lexical. No string whose CONTENT an
+ * upstream chooses appears in a message at all -- not the body, not one field
+ * lifted out of it, not the reason phrase. A message is built from the numeric
+ * status, the byte length, our own wording, and the reduced endpoint. There is
+ * no filter to out-encode because there is no admitted string.
+ */
+describe("no upstream-chosen bytes reach a message", () => {
+  const KEY_A = "A".repeat(64);
+
+  async function messageFor(
+    response: Response,
+    options: { apiKey?: string; unsafeErrorDetail?: boolean } = {},
+  ): Promise<string> {
+    const { fetchImpl } = recordingFetch(response);
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: options.apiKey ?? KEY,
+      fetchImpl,
+      unsafeErrorDetail: options.unsafeErrorDetail,
+    });
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error).toBeInstanceOf(UpstreamError);
+    return error.message;
+  }
+
+  /** Everything a message may contain, and there is nothing else. */
+  function assertBuiltOnlyFromTrustedParts(
+    message: string,
+    status: number,
+    bytes: number,
+  ): void {
+    expect(message).toContain(`HTTP ${status}`);
+    expect(message).toContain(`<${bytes} bytes, not shown>`);
+  }
+
+  const bodyOf = (payload: unknown): string => JSON.stringify(payload);
+
+  it("R1: drops a body field that smuggles the key through html numeric refs", async () => {
+    const smuggled = [...KEY_A]
+      .map((c, i) => (i > 0 && i % 15 === 0 ? `&#${c.charCodeAt(0)};` : c))
+      .join("");
+    const body = bodyOf({ error: smuggled });
+
+    const message = await messageFor(
+      new Response(body, { status: 500, headers: { "content-type": "application/json" } }),
+      { apiKey: KEY_A },
+    );
+
+    // Decoding the entities is what round 7 shipped: `&#65;` is an `A`.
+    const decoded = message.replace(/&#(\d+);/g, (_, d: string) =>
+      String.fromCharCode(Number(d)),
+    );
+    expect(decoded).not.toContain(KEY_A);
+    expect(message).not.toContain("&#65;");
+    assertBuiltOnlyFromTrustedParts(message, 500, Buffer.byteLength(body));
+  });
+
+  it("R2: drops a body field that smuggles the key through base64", async () => {
+    const encoded = Buffer.from(KEY_A, "utf8").toString("base64");
+    const body = bodyOf({ error: `token ${encoded}` });
+
+    const message = await messageFor(
+      new Response(body, { status: 500, headers: { "content-type": "application/json" } }),
+      { apiKey: KEY_A },
+    );
+
+    expect(message).not.toContain(encoded);
+    assertBuiltOnlyFromTrustedParts(message, 500, Buffer.byteLength(body));
+  });
+
+  it("R3: drops a body field that smuggles the key through hex", async () => {
+    const encoded = Buffer.from(KEY_A, "utf8").toString("hex");
+    const body = bodyOf({ error: `token ${encoded}` });
+
+    const message = await messageFor(
+      new Response(body, { status: 500, headers: { "content-type": "application/json" } }),
+      { apiKey: KEY_A },
+    );
+
+    expect(message).not.toContain(encoded);
+    assertBuiltOnlyFromTrustedParts(message, 500, Buffer.byteLength(body));
+  });
+
+  // A real key, not a run of As: the round-7 check would not have fired on this
+  // one even in its literal form once base64 had rewritten every character.
+  it("R4: drops a body field that base64s a realistic key", async () => {
+    const key = "sk-live-7f3a9c2e8b1d4f6a0c5e2b9d";
+    const encoded = Buffer.from(key, "utf8").toString("base64");
+    const body = bodyOf({ error: `auth failed for ${encoded}` });
+
+    const message = await messageFor(
+      new Response(body, { status: 500, headers: { "content-type": "application/json" } }),
+      { apiKey: key },
+    );
+
+    expect(message).not.toContain(encoded);
+    expect(message).not.toContain(key);
+    assertBuiltOnlyFromTrustedParts(message, 500, Buffer.byteLength(body));
+  });
+
+  /**
+   * R6. Two 15-character halves, neither long enough to trip a 16-character
+   * window, one carried by the reason phrase and one by the body field. The
+   * message reassembled the key with a `: ` between the halves. ACCEPTED 1
+   * retires this as a side effect: neither half has anywhere left to ride.
+   */
+  it("R6: neither the reason phrase nor the body can carry half a key", async () => {
+    const key = `${"A".repeat(15)}${"B".repeat(15)}`;
+    const body = bodyOf({ error: key.slice(15) });
+
+    const message = await messageFor(
+      new Response(body, {
+        status: 500,
+        statusText: key.slice(0, 15),
+        headers: { "content-type": "application/json" },
+      }),
+      { apiKey: key },
+    );
+
+    expect(message.replace(/[^A-Za-z0-9]/g, "")).not.toContain(key);
+    expect(message).not.toContain(key.slice(0, 15));
+    expect(message).not.toContain(key.slice(15));
+    assertBuiltOnlyFromTrustedParts(message, 500, Buffer.byteLength(body));
+  });
+
+  /**
+   * The finding, stated without an attack. A clean, harmless, obviously useful
+   * sentence is dropped too -- because whether a string is safe is exactly the
+   * question five rounds of filters got wrong, so the message stops asking it.
+   */
+  it("does not quote even a harmless error field", async () => {
+    const body = bodyOf({ error: "rate limit exceeded" });
+
+    const message = await messageFor(
+      new Response(body, { status: 429, headers: { "content-type": "application/json" } }),
+    );
+
+    expect(message).not.toContain("rate limit exceeded");
+    assertBuiltOnlyFromTrustedParts(message, 429, Buffer.byteLength(body));
+  });
+
+  it("does not quote a JSON-RPC error.message either", async () => {
+    const body = bodyOf({
+      jsonrpc: "2.0",
+      id: 7,
+      error: { code: -32600, message: "bad request" },
+    });
+
+    const message = await messageFor(
+      new Response(body, { status: 400, headers: { "content-type": "application/json" } }),
+    );
+
+    expect(message).not.toContain("bad request");
+    assertBuiltOnlyFromTrustedParts(message, 400, Buffer.byteLength(body));
+  });
+
+  // statusText crosses the wire and an upstream picks it, so it is the same
+  // class as the body. Being benign is not a property the message can check.
+  it("does not quote even a standard reason phrase", async () => {
+    const message = await messageFor(
+      new Response(null, { status: 502, statusText: "Bad Gateway" }),
+    );
+
+    expect(message).not.toContain("Bad Gateway");
+    expect(message).toContain("HTTP 502");
+  });
+
+  it("quotes nothing of the body on the auth path either", async () => {
+    const body = bodyOf({ error: "Invalid API key. The key is unknown." });
+    const message = await messageFor(
+      new Response(body, {
+        status: 401,
+        statusText: "Unauthorized by Crispy",
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    expect(message).not.toContain("Unauthorized by Crispy");
+    expect(message).not.toContain("The key is unknown");
+    assertBuiltOnlyFromTrustedParts(message, 401, Buffer.byteLength(body));
+  });
+
+  it("keeps no reason phrase on the expired-session path either", async () => {
+    const { fetchImpl } = recordingFetch([
+      jsonResponse(
+        { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+        { headers: { "mcp-session-id": "sess-live" } },
+      ),
+      new Response(null, { status: 404, statusText: "Gone From crispy-42" }),
+    ]);
+    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
+    await client.send({ jsonrpc: "2.0", id: 1, method: "initialize" });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.kind).toBe("session");
+    expect(error.message).not.toContain("Gone From crispy-42");
+    expect(error.message).toContain("HTTP 404");
+  });
+});
+
+/**
+ * ACCEPTED 2. The cost of dropping every upstream-chosen string is real: a 400
+ * now reads as a number. CRISPY_MCP_UNSAFE_ERROR_DETAIL=1 buys it back, and the
+ * name is the documentation. It is off unless the value is exactly `1`, so it
+ * cannot be turned on by a truthy string somebody pasted into a config.
+ */
+describe("CRISPY_MCP_UNSAFE_ERROR_DETAIL", () => {
+  async function messageFor(
+    response: Response,
+    options: { apiKey?: string; unsafeErrorDetail?: boolean } = {},
+  ): Promise<string> {
+    const { fetchImpl } = recordingFetch(response);
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: options.apiKey ?? KEY,
+      fetchImpl,
+      unsafeErrorDetail: options.unsafeErrorDetail,
+    });
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error).toBeInstanceOf(UpstreamError);
+    return error.message;
+  }
+
+  it("restores the lost diagnostic when it is on", async () => {
+    const message = await messageFor(
+      new Response(JSON.stringify({ error: "rate limit exceeded" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      }),
+      { unsafeErrorDetail: true },
+    );
+
+    expect(message).toContain("rate limit exceeded");
+  });
+
+  it("shows a body that is not JSON at all when it is on", async () => {
+    const message = await messageFor(
+      new Response("<html>gateway down</html>", { status: 502 }),
+      { unsafeErrorDetail: true },
+    );
+
+    expect(message).toContain("gateway down");
+  });
+
+  it("is off by default", async () => {
+    const message = await messageFor(
+      new Response(JSON.stringify({ error: "rate limit exceeded" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    expect(message).not.toContain("rate limit exceeded");
+  });
+
+  /**
+   * Best effort, and the word is chosen. Subtracting the key out of a body the
+   * upstream wrote is exactly the game rounds 4 through 7 kept losing; it is
+   * kept here because it costs nothing and catches the careless case, not
+   * because it is sound. The README says so too.
+   */
+  it("still subtracts a literal key from the detail it shows", async () => {
+    const message = await messageFor(
+      new Response(JSON.stringify({ error: `key ${KEY} is revoked` }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+      { unsafeErrorDetail: true },
+    );
+
+    expect(message).not.toContain(KEY);
+    expect(message).toContain("is revoked");
+  });
+
+  it("caps the detail it shows", async () => {
+    const message = await messageFor(
+      new Response(JSON.stringify({ error: "q".repeat(8_000) }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+      { unsafeErrorDetail: true },
+    );
+
+    expect(message).toContain("...");
+    expect(message.length).toBeLessThan(2_000);
+  });
+
+  it("does not weaken the endpoint reduction", async () => {
+    const leaky = `https://crispy.test/token/hunter2/api/mcp`;
+    const fetchImpl = (async () => {
+      throw new TypeError("fetch failed: ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    const client = new UpstreamClient({
+      url: leaky,
+      apiKey: KEY,
+      fetchImpl,
+      unsafeErrorDetail: true,
+    });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.message).not.toContain("hunter2");
+  });
+});
+
+/**
+ * ACCEPTED 3. readBounded's deadline rearms on every chunk, so a server that
+ * drips one byte inside every gap window keeps send() pending for as long as it
+ * likes while the body piles up in memory. The gap bound detects a stall; it
+ * does not bound a wedge. Both absolute ceilings fail closed with their own
+ * wording, so a diagnostic says which one bit.
+ */
+describe("UpstreamClient absolute body bounds", () => {
+  function scriptedBody(): {
+    body: ReadableStream<Uint8Array>;
+    push: (text: string) => void;
+    close: () => void;
+    cancelled: () => boolean;
+  } {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return {
+      body,
+      push: (text) => controller.enqueue(new TextEncoder().encode(text)),
+      close: () => controller.close(),
+      cancelled: () => cancelled,
+    };
+  }
+
+  it("cuts off a body that drips inside every gap window for ever", async () => {
+    const dripping = scriptedBody();
+    const { fetchImpl } = recordingFetch(
+      new Response(dripping.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      // A drip every 5ms rearms a 40ms gap bound for ever. 60ms of total
+      // patience is what ends it.
+      timeoutMs: 40,
+      maxBodyMs: 60,
+    });
+
+    const pending = client.send(TOOL_CALL);
+    let drips = 0;
+    const drip = setInterval(() => {
+      drips += 1;
+      dripping.push("x");
+    }, 5);
+
+    const error = (await pending.catch((e: unknown) => e)) as UpstreamError;
+    clearInterval(drip);
+
+    expect(error).toBeInstanceOf(UpstreamError);
+    expect(error.kind).toBe("network");
+    expect(error.message).toMatch(/did not finish within 60ms/);
+    // Proves the gap bound never fired: it was rearmed every 5ms.
+    expect(drips, "the body stopped dripping on its own").toBeGreaterThan(4);
+    expect(dripping.cancelled(), "the dripping body was not cancelled").toBe(
+      true,
+    );
+  });
+
+  it("cuts off a body that floods past the total-bytes ceiling", async () => {
+    const flooding = scriptedBody();
+    const { fetchImpl } = recordingFetch(
+      new Response(flooding.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      timeoutMs: 1_000,
+      maxBodyBytes: 1_000,
+    });
+
+    const settled = client.send(TOOL_CALL).catch((e: unknown) => e);
+    // Two chunks, neither over the ceiling on its own. The ceiling counts the
+    // total, so it is the second one that trips it -- which is the case a
+    // per-chunk check would miss.
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    flooding.push("y".repeat(600));
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    expect(flooding.cancelled(), "600 bytes is under the ceiling").toBe(false);
+    flooding.push("y".repeat(600));
+
+    const error = (await settled) as UpstreamError;
+
+    expect(error).toBeInstanceOf(UpstreamError);
+    expect(error.kind).toBe("network");
+    expect(error.message).toMatch(/grew past 1000 bytes/);
+    expect(flooding.cancelled(), "the flooding body was not cancelled").toBe(
+      true,
+    );
+  });
+
+  it("says nothing of the body it abandoned but its size", async () => {
+    const flooding = scriptedBody();
+    const secret = "sk-live-0123456789abcdef";
+    const { fetchImpl } = recordingFetch(
+      new Response(flooding.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: secret,
+      fetchImpl,
+      timeoutMs: 1_000,
+      maxBodyBytes: 100,
+    });
+
+    const settled = client.send(TOOL_CALL).catch((e: unknown) => e);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    flooding.push(`${secret} `.repeat(20));
+
+    const error = (await settled) as UpstreamError;
+
+    expect(error.message).not.toContain(secret);
+    expect(error.message).not.toContain("sk-live");
+  });
+
+  /**
+   * The ceilings must not be reachable by anything Crispy legitimately sends.
+   * A tool result is JSON destined for a model's context window; these leave
+   * three orders of magnitude of headroom over the largest of them.
+   */
+  it("ships ceilings far above any legitimate response", async () => {
+    expect(DEFAULT_MAX_BODY_BYTES).toBe(64 * 1024 * 1024);
+    expect(DEFAULT_MAX_BODY_MS).toBe(600_000);
+    expect(DEFAULT_MAX_BODY_MS).toBeGreaterThan(DEFAULT_TIMEOUT_MS);
   });
 });
