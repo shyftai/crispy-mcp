@@ -32,14 +32,29 @@ export function createShutdown(options: ShutdownOptions): () => Promise<void> {
       timer = setTimeout(resolve, options.timeoutMs);
     });
 
+    // Both stages are best effort, and `.catch()` on the call is not enough to
+    // make them so: it only sees a rejected return value. close() comes from
+    // the SDK, so it can just as well throw before it returns anything at all,
+    // and that would reject the handshake, reject the race, and skip the exit
+    // this handler exists to guarantee.
+    const attempt = async (step: () => Promise<void>): Promise<void> => {
+      try {
+        await step();
+      } catch {
+        // Nobody to tell: the process is on its way out either way.
+      }
+    };
+
     const handshake = (async () => {
-      await options.endSession().catch(() => undefined);
-      await options.close().catch(() => undefined);
+      await attempt(() => options.endSession());
+      await attempt(() => options.close());
     })();
 
-    await Promise.race([handshake, deadline]);
-
-    clearTimeout(timer);
-    options.exit();
+    try {
+      await Promise.race([handshake, deadline]);
+    } finally {
+      clearTimeout(timer);
+      options.exit();
+    }
   };
 }
