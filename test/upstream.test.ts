@@ -400,20 +400,10 @@ describe("UpstreamClient.send", () => {
     expect(error.message).not.toContain(KEY);
   });
 
-  it("never puts the api key in an error message when it is in the status line", async () => {
-    const { fetchImpl } = recordingFetch(
-      new Response(null, { status: 500, statusText: `rejected ${KEY}` }),
-    );
-    const client = new UpstreamClient({ url: URL, apiKey: KEY, fetchImpl });
-
-    const error = (await client
-      .send(TOOL_CALL)
-      .catch((e: unknown) => e)) as UpstreamError;
-
-    expect(error.kind).toBe("http");
-    expect(error.message).not.toContain(KEY);
-    expect(error.message).toContain("[redacted]");
-  });
+  // RETIRED in round 7: this asserted the status line came back REDACTED.
+  // ACCEPTED 1 character-classes the status line and drops it whole instead, so
+  // there is no "[redacted]" to find. See "the status line" under
+  // describe("UpstreamClient message construction").
 
   // CRISPY_MCP_URL is user-supplied and unrestricted. An endpoint that carries
   // the key in a query component turns every message that names the url into a
@@ -552,13 +542,18 @@ describe("UpstreamClient.send", () => {
       });
 
       /**
-       * The sink removes the url; it must not flatten the message. A url that
-       * parses and simply refuses the connection puts nothing derived from the
-       * raw url into the reason, so the reason has to come through intact --
-       * otherwise an operator cannot tell a refused connection from a dns
-       * failure. This is what fails if the sink is applied to the assembled
-       * message rather than to the untrusted fragments of it: here the raw url
-       * and the safe url are the same string.
+       * What this proves, and no more: the sink is applied to the untrusted
+       * FRAGMENT and not to the assembled message, so a reason with nothing to
+       * remove comes through intact and an operator can still tell a refused
+       * connection from a dns failure.
+       *
+       * What it does NOT prove, though it used to claim to: that the url is
+       * treated as a secret only when it carries one. undici answers a refused
+       * connection with "fetch failed" and never quotes the url, so forcing
+       * every url to be a secret leaves this green. That claim needs a reason
+       * that contains the url -- see "leaves a platform error that quotes a
+       * clean url alone" under describe("UpstreamClient endpoint
+       * identification"), which is the same assertion with a reason that bites.
        */
       it("leaves a clean platform error alone", async () => {
         const dead = "http://127.0.0.1:1/api/mcp";
@@ -1011,210 +1006,31 @@ describe("UpstreamClient shutdown", () => {
   });
 });
 
-/**
- * Every string this client did not author itself goes through one sink before a
- * message can quote it, and these are the ways that sink was getting it wrong:
- * it cut the text down before it scrubbed it, it matched a hand-written list of
- * encodings, and it treated the endpoint url as a secret even when the url held
- * nothing worth hiding.
+/*
+ * RETIRED in round 7, all of describe("UpstreamClient redaction"):
+ *
+ *   - "when a credential straddles the snippet boundary" (3 tests). Subject was
+ *     the scrub-then-cut order of a body SNIPPET. ACCEPTED 1 deleted the
+ *     snippet: no raw body text reaches a message, so there is no boundary for
+ *     a credential to straddle. The ordering lesson survives where it still
+ *     applies -- see "checks the whole field before capping it" and "scrubs the
+ *     whole reason before cutting it down".
+ *
+ *   - "whatever encoding a credential arrives wearing" (15 tests). Subject was
+ *     subtracting a credential out of an upstream body and an upstream status
+ *     line. ACCEPTED 1 deleted both: the body contributes one allowlisted field
+ *     or a byte count, and the status line is character-classed. The FORMS
+ *     table moved rather than died -- it now drives "the construction does not
+ *     care what encoding a credential wears" and the platform-error sink, which
+ *     is the one place subtraction still happens.
+ *
+ *   - "when the endpoint carries no credential at all" (4 tests). Subject was
+ *     which parts of the url make it a secret, probed through a BODY that names
+ *     the url. Bodies no longer reach messages; ACCEPTED 2 replaced the
+ *     predicate with "the raw url is a secret iff the safe url is not the raw
+ *     url", and it is probed through the platform-error channel instead, in
+ *     describe("UpstreamClient endpoint identification").
  */
-describe("UpstreamClient redaction", () => {
-  async function messageFrom(
-    response: Response,
-    options: { url?: string; apiKey?: string } = {},
-  ): Promise<string> {
-    const { fetchImpl } = recordingFetch(response);
-    const client = new UpstreamClient({
-      url: options.url ?? URL,
-      apiKey: options.apiKey ?? KEY,
-      fetchImpl,
-    });
-    const error = (await client
-      .send(TOOL_CALL)
-      .catch((e: unknown) => e)) as UpstreamError;
-    expect(error).toBeInstanceOf(UpstreamError);
-    return error.message;
-  }
-
-  /**
-   * A body is cut down to a snippet before a message shows it. Cutting first
-   * splits a credential that straddles the boundary, and half a credential
-   * matches nothing a whole-key search is looking for -- so the surviving
-   * prefix went to stderr and into the JSON-RPC error the client is handed.
-   * Scrub, then cut: in that order the cut can only ever land on text that is
-   * already safe.
-   */
-  describe("when a credential straddles the snippet boundary", () => {
-    const LONG_KEY = "sk-live-0123456789abcdef0123456789ab";
-
-    it("keeps no part of a straddling key out of an http error", async () => {
-      const message = await messageFrom(
-        new Response(`${"x".repeat(480)}${LONG_KEY} and more`, { status: 500 }),
-        { apiKey: LONG_KEY },
-      );
-
-      expect(message).toContain("[redacted]");
-      expect(message).not.toContain(LONG_KEY);
-      // The prefix the old cut-then-scrub order left behind.
-      expect(message).not.toContain(LONG_KEY.slice(0, 20));
-      expect(message).not.toContain("sk-live");
-    });
-
-    it("keeps no part of a straddling key out of a not-JSON error", async () => {
-      const message = await messageFrom(
-        new Response(`${"y".repeat(480)}${LONG_KEY} and more`, {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-        { apiKey: LONG_KEY },
-      );
-
-      expect(message).toMatch(/not JSON/i);
-      expect(message).not.toContain(LONG_KEY.slice(0, 20));
-      expect(message).not.toContain("sk-live");
-    });
-
-    // Scrubbing first must not turn the bound off: an upstream body has no size
-    // limit and a message is read by a human.
-    it("still cuts an over-long body down to a snippet", async () => {
-      const message = await messageFrom(
-        new Response("z".repeat(4_000), { status: 500 }),
-      );
-
-      expect(message).toContain("...");
-      expect(message.length).toBeLessThan(700);
-    });
-  });
-
-  /**
-   * Enumerating encodings is a losing game. The list that was here covered the
-   * literal, encodeURIComponent, encodeURI and an all-lowercase escape form,
-   * and still missed application/x-www-form-urlencoded -- where a space is `+`
-   * -- and any mixture of escape cases. So the text is decoded and the match is
-   * made against the decoded form, which covers the encodings nobody listed.
-   */
-  describe("whatever encoding a credential arrives wearing", () => {
-    const AWKWARD = "sk live+key/with=specials";
-
-    const hex = (text: string): string =>
-      [...text]
-        .map(
-          (character) =>
-            `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
-        )
-        .join("");
-
-    const FORMS: Array<[string, string]> = [
-      ["the literal key", AWKWARD],
-      ["encodeURIComponent", encodeURIComponent(AWKWARD)],
-      // Leaves `+`, `/` and `=` alone, so `+` here is a plus, not a space.
-      ["encodeURI", encodeURI(AWKWARD)],
-      [
-        "all-lowercase escapes",
-        encodeURIComponent(AWKWARD).replace(/%[0-9A-F]{2}/g, (escape) =>
-          escape.toLowerCase(),
-        ),
-      ],
-      ["mixed-case escapes", "sk%20live%2Bkey%2fwith%3dspecials"],
-      ["form-urlencoded, where a space is +", "sk+live%2Bkey%2Fwith%3Dspecials"],
-      ["every character escaped", hex(AWKWARD)],
-    ];
-
-    it.each(FORMS)("redacts %s out of a body", async (_form, encoded) => {
-      const message = await messageFrom(
-        new Response(`upstream said: ${encoded}`, { status: 500 }),
-        { apiKey: AWKWARD },
-      );
-
-      expect(message).not.toContain(encoded);
-      expect(message).not.toContain(AWKWARD);
-      expect(message).toContain("[redacted]");
-      // The redaction has to be surgical: the rest of the body is the diagnostic.
-      expect(message).toContain("upstream said:");
-    });
-
-    it.each(FORMS)("redacts %s out of the status line", async (_form, encoded) => {
-      const message = await messageFrom(
-        new Response(null, { status: 500, statusText: `rejected ${encoded}` }),
-        { apiKey: AWKWARD },
-      );
-
-      expect(message).not.toContain(encoded);
-      expect(message).not.toContain(AWKWARD);
-      expect(message).toContain("[redacted]");
-    });
-
-    // A body is not a url. `+` in an encodeURI'd string is a literal plus and
-    // in a form-encoded one it is a space, and the sink cannot know which, so
-    // it has to redact under either reading.
-    it("does not need to know which reading of + a body meant", async () => {
-      const plussed = await messageFrom(
-        new Response("upstream said: sk+live+key", { status: 500 }),
-        { apiKey: "sk live key" },
-      );
-      expect(plussed).not.toContain("sk+live+key");
-
-      const literal = await messageFrom(
-        new Response("upstream said: sk+live+key", { status: 500 }),
-        { apiKey: "sk+live+key" },
-      );
-      expect(literal).not.toContain("sk+live+key");
-    });
-  });
-
-  /**
-   * The raw url is a secret because undici quotes it back at us, query and all.
-   * That is only true of a url that carries something: strip userinfo, query
-   * and fragment from an endpoint that has none of them and the result is the
-   * url itself, so treating it as a secret redacts the endpoint out of every
-   * body that legitimately names it and destroys the diagnostic to protect
-   * nothing.
-   */
-  describe("when the endpoint carries no credential at all", () => {
-    it("lets a body name the endpoint", async () => {
-      const message = await messageFrom(
-        new Response(`route ${URL} is disabled`, { status: 500 }),
-      );
-
-      expect(message).toContain(`route ${URL} is disabled`);
-      expect(message).not.toContain("[redacted]");
-    });
-
-    it("still hides an endpoint that carries a query", async () => {
-      const leaky = `${URL}?api_key=${KEY}`;
-      const message = await messageFrom(
-        new Response(`route ${leaky} is disabled`, { status: 500 }),
-        { url: leaky },
-      );
-
-      expect(message).not.toContain(KEY);
-      expect(message).not.toContain("api_key");
-      expect(message).toContain("[redacted]");
-    });
-
-    it("still hides an endpoint that carries userinfo", async () => {
-      const leaky = "https://someone:hunter2@crispy.test/api/mcp";
-      const message = await messageFrom(
-        new Response(`route ${leaky} refused`, { status: 500 }),
-        { url: leaky },
-      );
-
-      expect(message).not.toContain("hunter2");
-      expect(message).toContain("[redacted]");
-    });
-
-    it("still hides an endpoint that carries a fragment", async () => {
-      const leaky = `${URL}#token-${KEY}`;
-      const message = await messageFrom(
-        new Response(`route ${leaky} refused`, { status: 500 }),
-        { url: leaky },
-      );
-
-      expect(message).not.toContain(KEY);
-      expect(message).toContain("[redacted]");
-    });
-  });
-});
 
 /**
  * A response body is a diagnostic detail and nothing more. It must not gate a
@@ -1342,5 +1158,662 @@ describe("UpstreamClient when a response body never finishes", () => {
     // Still diagnosable: the safe endpoint and the platform's own wording.
     expect(error.message).toContain("https://crispy.test/api/mcp");
     expect(error.message).toMatch(/terminated/);
+  });
+});
+
+/**
+ * Round 7's design change. Three rounds hardened a redactor that subtracts
+ * secrets out of upstream bytes, and each round found the next encoding that
+ * defeated it: truncation before scrubbing, then compression before
+ * truncation; single encoding, then double encoding; then a self-overlapping
+ * key. Subtraction inside attacker-chosen text cannot be finished.
+ *
+ * So no raw upstream body text reaches a message any more. A message is
+ * constructed out of parts we allow: the status code, a character-classed
+ * status line, and ONE field lifted out of a JSON body. Everything else is a
+ * byte count. There is no redactor left to defeat on this path because nothing
+ * untrusted reaches the message.
+ */
+/**
+ * The encodings the old redactor enumerated, kept because they are still the
+ * sharpest probe there is -- of the construction below, which does not have to
+ * know them, and of the platform-error sink further down, which still does.
+ */
+const AWKWARD_KEY = "sk live+key/with=specials";
+
+const hex = (text: string): string =>
+  [...text]
+    .map(
+      (character) =>
+        `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+    )
+    .join("");
+
+const FORMS: Array<[string, string]> = [
+  ["the literal key", AWKWARD_KEY],
+  ["encodeURIComponent", encodeURIComponent(AWKWARD_KEY)],
+  // Leaves `+`, `/` and `=` alone, so `+` here is a plus, not a space.
+  ["encodeURI", encodeURI(AWKWARD_KEY)],
+  [
+    "all-lowercase escapes",
+    encodeURIComponent(AWKWARD_KEY).replace(/%[0-9A-F]{2}/g, (escape) =>
+      escape.toLowerCase(),
+    ),
+  ],
+  ["mixed-case escapes", "sk%20live%2Bkey%2fwith%3dspecials"],
+  ["form-urlencoded, where a space is +", "sk+live%2Bkey%2Fwith%3Dspecials"],
+  ["every character escaped", hex(AWKWARD_KEY)],
+];
+
+describe("UpstreamClient message construction", () => {
+  async function messageFor(
+    response: Response,
+    options: { url?: string; apiKey?: string } = {},
+  ): Promise<string> {
+    const { fetchImpl } = recordingFetch(response);
+    const client = new UpstreamClient({
+      url: options.url ?? URL,
+      apiKey: options.apiKey ?? KEY,
+      fetchImpl,
+    });
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error).toBeInstanceOf(UpstreamError);
+    return error.message;
+  }
+
+  describe("the one field a JSON error body is allowed to contribute", () => {
+    // OBSERVED 2026-09-20 against https://crispy.sh/api/mcp with a bad bearer:
+    // {"error":"Invalid API key. ...","retryable":false,"suggestion":"..."}.
+    it("quotes the error field the Crispy API actually returns", async () => {
+      const message = await messageFor(
+        jsonResponse(
+          { error: "Invalid API key. The key is unknown or revoked." },
+          { status: 500 },
+        ),
+      );
+
+      expect(message).toContain("Invalid API key. The key is unknown or revoked.");
+    });
+
+    // The same endpoint speaks JSON-RPC, whose error is an object.
+    it("quotes error.message out of a JSON-RPC error object", async () => {
+      const message = await messageFor(
+        jsonResponse(
+          { jsonrpc: "2.0", id: 7, error: { code: -32600, message: "bad request" } },
+          { status: 400 },
+        ),
+      );
+
+      expect(message).toContain("bad request");
+    });
+
+    it("shows only a byte count when the body is not JSON", async () => {
+      const message = await messageFor(
+        new Response("<html>gateway down</html>", { status: 502 }),
+      );
+
+      expect(message).toContain("<25 bytes, not shown>");
+      expect(message).not.toContain("gateway down");
+    });
+
+    it("counts bytes rather than characters", async () => {
+      // Four characters, ten bytes. A character count would say 4.
+      const message = await messageFor(
+        new Response("néé\u{1F600}", { status: 500 }),
+      );
+
+      expect(message).toContain("<9 bytes, not shown>");
+    });
+
+    /**
+     * Replaces "keeps no part of a straddling key out of a not-JSON error",
+     * retired with the rest of describe("UpstreamClient redaction"): a 2xx body
+     * that is not JSON was quoted through the snippet, and now it is not quoted
+     * at all.
+     */
+    it("shows only a byte count for a 2xx body that is not JSON", async () => {
+      const key = "sk-live-0123456789abcdef";
+      const message = await messageFor(
+        new Response(`${"y".repeat(480)}${key} and more`, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        { apiKey: key },
+      );
+
+      expect(message).toMatch(/not JSON/i);
+      expect(message).not.toContain("sk-live");
+      expect(message).toContain("<513 bytes, not shown>");
+    });
+
+    it("shows only a byte count when the JSON has no error field", async () => {
+      const message = await messageFor(
+        jsonResponse({ detail: "something went wrong" }, { status: 500 }),
+      );
+
+      expect(message).toContain("bytes, not shown");
+      expect(message).not.toContain("something went wrong");
+    });
+
+    it("drops a field carrying a percent escape rather than decoding it", async () => {
+      const message = await messageFor(
+        jsonResponse({ error: "rejected %73%65%63" }, { status: 500 }),
+      );
+
+      expect(message).not.toContain("%73");
+      expect(message).not.toContain("rejected");
+      expect(message).toContain("bytes, not shown");
+    });
+
+    it("drops a field carrying a control character", async () => {
+      const message = await messageFor(
+        jsonResponse({ error: "rejected\u001b[2Jcleared" }, { status: 500 }),
+      );
+
+      expect(message).not.toContain("cleared");
+      expect(message).toContain("bytes, not shown");
+    });
+
+    it("drops a field carrying non-ascii text", async () => {
+      const message = await messageFor(
+        jsonResponse({ error: "rejected ‮rossim" }, { status: 500 }),
+      );
+
+      expect(message).not.toContain("rossim");
+      expect(message).toContain("bytes, not shown");
+    });
+
+    /**
+     * A real api key is plain ascii, so it passes the character class on its
+     * own merits. The class check is not the whole defence: the field is
+     * dropped WHOLE if it carries a secret. Dropping rather than subtracting is
+     * what makes this sound -- there is no surviving remainder to get the
+     * boundary wrong on, which is the bug every previous round found.
+     */
+    it("drops the whole field when the upstream echoes the api key", async () => {
+      const message = await messageFor(
+        jsonResponse({ error: `key ${KEY} is revoked` }, { status: 500 }),
+      );
+
+      expect(message).not.toContain(KEY);
+      expect(message).not.toContain("is revoked");
+      expect(message).toContain("bytes, not shown");
+    });
+
+    /**
+     * F1 and F3 were both "63 characters of a 64-character key reach the
+     * message". ACCEPTED 1 deleted the two paths that manufactured that prefix,
+     * but a whole-key check would hand the same prefix straight back the moment
+     * an upstream echoed a truncated key -- and truncating a credential before
+     * logging it is what a careful server does. So a long enough RUN of the key
+     * drops the field, not just the key entire.
+     */
+    it("drops the whole field when the upstream echoes a truncated key", async () => {
+      const message = await messageFor(
+        jsonResponse({ error: `key ${KEY.slice(0, 20)} is revoked` }, { status: 500 }),
+      );
+
+      expect(message).not.toContain(KEY.slice(0, 20));
+      expect(message).toContain("bytes, not shown");
+    });
+
+    // The run has to be long enough not to fire on a shared key PREFIX, or
+    // every body that explains the key format loses its diagnostic.
+    it("keeps a field that merely names the key's format", async () => {
+      const message = await messageFor(
+        jsonResponse(
+          { error: "Provide the key as: Authorization: Bearer sk-live-..." },
+          { status: 401 },
+        ),
+        { apiKey: "sk-live-0123456789abcdef0123456789ab" },
+      );
+
+      expect(message).toContain("Authorization: Bearer sk-live-...");
+    });
+
+    it("drops the whole field when the key arrives with + for its spaces", async () => {
+      const spaced = "sk live key";
+      const message = await messageFor(
+        jsonResponse({ error: `key sk+live+key is revoked` }, { status: 500 }),
+        { apiKey: spaced },
+      );
+
+      expect(message).not.toContain("sk+live+key");
+      expect(message).toContain("bytes, not shown");
+    });
+
+    /**
+     * Check the whole field, then cut. Cutting first and checking the cut is
+     * the round-6 bug in a new place: a key straddling the cap would lose its
+     * tail and the prefix would survive the check.
+     */
+    it("checks the whole field before capping it", async () => {
+      const straddling = `${"n".repeat(295)}${KEY} and more`;
+      const message = await messageFor(
+        jsonResponse({ error: straddling }, { status: 500 }),
+      );
+
+      expect(message).not.toContain(KEY.slice(0, 20));
+      expect(message).toContain("bytes, not shown");
+    });
+
+    it("caps a clean but over-long field", async () => {
+      const message = await messageFor(
+        jsonResponse({ error: "q".repeat(4_000) }, { status: 500 }),
+      );
+
+      expect(message).toContain("...");
+      expect(message.length).toBeLessThan(500);
+    });
+  });
+
+  /**
+   * The old sink answered this table by decoding the text and matching the
+   * decoded form, and round 7 found the double encoding that beat it. The
+   * construction answers it by not reading the text at all: six of these seven
+   * carry a `%` and fail the character class, and the seventh is the key
+   * itself. Nothing here is decoded, so there is no decoding to out-run.
+   */
+  describe("the construction does not care what encoding a credential wears", () => {
+    it.each(FORMS)("drops a body field carrying %s", async (_form, encoded) => {
+      const message = await messageFor(
+        jsonResponse({ error: `upstream said: ${encoded}` }, { status: 500 }),
+        { apiKey: AWKWARD_KEY },
+      );
+
+      expect(message).not.toContain(encoded);
+      expect(message).not.toContain(AWKWARD_KEY);
+      expect(message).toContain("bytes, not shown");
+    });
+
+    it.each(FORMS)("drops a status line carrying %s", async (_form, encoded) => {
+      const message = await messageFor(
+        new Response(null, { status: 500, statusText: `rejected ${encoded}` }),
+        { apiKey: AWKWARD_KEY },
+      );
+
+      expect(message).not.toContain(encoded);
+      expect(message).not.toContain(AWKWARD_KEY);
+      expect(message).toContain("HTTP 500");
+    });
+  });
+
+  describe("the status line", () => {
+    it("keeps a normal reason phrase", async () => {
+      const message = await messageFor(
+        new Response(null, { status: 502, statusText: "Bad Gateway" }),
+      );
+
+      expect(message).toContain("HTTP 502 Bad Gateway");
+    });
+
+    it("drops a reason phrase carrying the api key and keeps the status", async () => {
+      const message = await messageFor(
+        new Response(null, { status: 500, statusText: `rejected ${KEY}` }),
+      );
+
+      expect(message).not.toContain(KEY);
+      expect(message).not.toContain("rejected");
+      expect(message).toContain("HTTP 500");
+    });
+
+    it("drops a reason phrase carrying a percent escape", async () => {
+      const message = await messageFor(
+        new Response(null, { status: 500, statusText: "rejected %73%65%63" }),
+      );
+
+      expect(message).not.toContain("%73");
+      expect(message).toContain("HTTP 500");
+    });
+
+    // No `%` to fail the class on, so the class is not what catches this: a
+    // form-encoded space is the one reading left inside plain ascii.
+    it("drops a reason phrase carrying the key with + for its spaces", async () => {
+      const message = await messageFor(
+        new Response(null, { status: 500, statusText: "rejected sk+live+key" }),
+        { apiKey: "sk live key" },
+      );
+
+      expect(message).not.toContain("sk+live+key");
+      expect(message).toContain("HTTP 500");
+    });
+
+    it("caps an over-long reason phrase", async () => {
+      const message = await messageFor(
+        new Response(null, { status: 500, statusText: "w".repeat(400) }),
+      );
+
+      expect(message).not.toContain("w".repeat(200));
+      expect(message).toContain("HTTP 500");
+    });
+  });
+
+  /** The three findings the construction deletes rather than defends. */
+  describe("the findings this design retires", () => {
+    it("F1: a key repeated past the old 64-KiB scrub bound leaks nothing", async () => {
+      const key = "k".repeat(64);
+      const message = await messageFor(
+        new Response(`x${key.repeat(1024)}`, { status: 500 }),
+        { apiKey: key },
+      );
+
+      expect(message).not.toContain("k".repeat(63));
+      expect(message).toContain("<65537 bytes, not shown>");
+    });
+
+    it("F2: a double-encoded key leaks nothing", async () => {
+      const key = "sk live+key";
+      const doubled = encodeURIComponent(encodeURIComponent(key));
+      const message = await messageFor(
+        jsonResponse({ error: `upstream said: ${doubled}` }, { status: 500 }),
+        { apiKey: key },
+      );
+
+      expect(message).not.toContain(doubled);
+      expect(message).not.toContain(key);
+      expect(message).toContain("bytes, not shown");
+    });
+
+    it("F3: a self-overlapping key leaks no tail", async () => {
+      const key = "A".repeat(64);
+      const message = await messageFor(
+        new Response("A".repeat(127), { status: 500 }),
+        { apiKey: key },
+      );
+
+      expect(message).not.toContain("A".repeat(63));
+      expect(message).toContain("<127 bytes, not shown>");
+    });
+  });
+});
+
+/**
+ * F4. carriesCredential() looked at userinfo, query and fragment, and
+ * endpointForMessage() kept the whole pathname -- so a credential in a path
+ * segment of CRISPY_MCP_URL went straight into a diagnostic. CRISPY_MCP_URL is
+ * unrestricted and a path segment can be anything, so a message gets the origin
+ * and, at most, the SHAPE of the path.
+ */
+describe("UpstreamClient endpoint identification", () => {
+  const refusingFetch = (async () => {
+    throw new TypeError("fetch failed: ECONNREFUSED");
+  }) as unknown as typeof fetch;
+
+  async function messageFor(
+    url: string,
+    apiKey = KEY,
+    fetchImpl: typeof fetch = refusingFetch,
+  ): Promise<string> {
+    const client = new UpstreamClient({ url, apiKey, fetchImpl });
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    expect(error).toBeInstanceOf(UpstreamError);
+    return error.message;
+  }
+
+  it("F4: never prints a credential sitting in a path segment", async () => {
+    const message = await messageFor(
+      "https://crispy.test/token/hunter2/api/mcp",
+      "an-unrelated-bearer-key",
+    );
+
+    expect(message).not.toContain("hunter2");
+    expect(message).not.toContain("/token/");
+    expect(message).toContain("https://crispy.test");
+    expect(message).toContain("4 path segments");
+  });
+
+  it("prints the default endpoint's path in full", async () => {
+    const message = await messageFor("https://crispy.test/api/mcp");
+
+    expect(message).toContain("https://crispy.test/api/mcp");
+    expect(message).not.toContain("path segment");
+  });
+
+  it("says nothing of a path when there is none", async () => {
+    const message = await messageFor("https://crispy.test/");
+
+    expect(message).toContain("https://crispy.test");
+    expect(message).not.toContain("path segment");
+  });
+
+  it("counts a single segment in the singular", async () => {
+    const message = await messageFor("https://crispy.test/mcp");
+
+    expect(message).toContain("1 path segment");
+    expect(message).not.toContain("/mcp");
+  });
+
+  /**
+   * The raw url is a secret exactly when the safe url is not the raw url:
+   * undici quotes the raw url back at us in its own wording, so anything the
+   * reduction above dropped would re-enter through the platform's message.
+   * One rule, and it is the reduction's own rule rather than a second
+   * predicate that can drift away from it.
+   */
+  it("keeps a path credential out of the platform's own wording too", async () => {
+    const url = "https://crispy.test/token/hunter2/api/mcp";
+    const quoting = (async () => {
+      throw new TypeError(`Failed to parse URL from ${url}`);
+    }) as unknown as typeof fetch;
+
+    const message = await messageFor(url, "an-unrelated-bearer-key", quoting);
+
+    expect(message).not.toContain("hunter2");
+    expect(message).toContain("[redacted]");
+  });
+
+  /**
+   * ...and it must not flatten a clean one. A url that is its own safe form is
+   * not a secret, so the platform's wording comes through intact. This is what
+   * :563 could not tell apart: its platform error never contained the url, so
+   * forcing every url to be a secret left it green.
+   */
+  it("leaves a platform error that quotes a clean url alone", async () => {
+    const url = "https://crispy.test/api/mcp";
+    const quoting = (async () => {
+      throw new TypeError(`Failed to parse URL from ${url}`);
+    }) as unknown as typeof fetch;
+
+    const message = await messageFor(url, KEY, quoting);
+
+    expect(message).toContain(`Failed to parse URL from ${url}`);
+    expect(message).not.toContain("[redacted]");
+  });
+});
+
+/**
+ * ACCEPTED 3 and 4. A 2xx whose body hangs never settled: readBody had no
+ * deadline and the request timer was cleared at headers. That is the same
+ * wedge class this branch exists to fix, reached through a different door.
+ */
+describe("UpstreamClient body reading", () => {
+  /** A body that opens, emits what it is given, and closes when told. */
+  function scriptedBody(): {
+    body: ReadableStream<Uint8Array>;
+    push: (text: string) => void;
+    close: () => void;
+    cancelled: () => boolean;
+  } {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return {
+      body,
+      push: (text) => controller.enqueue(new TextEncoder().encode(text)),
+      close: () => controller.close(),
+      cancelled: () => cancelled,
+    };
+  }
+
+  it("fails closed when a 2xx body stops arriving, rather than hanging", async () => {
+    const stalled = scriptedBody();
+    const { fetchImpl } = recordingFetch(
+      new Response(stalled.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      timeoutMs: 30,
+    });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error).toBeInstanceOf(UpstreamError);
+    expect(error.kind).toBe("network");
+    expect(error.message).toMatch(/stopped sending/i);
+    expect(error.message).toContain("https://crispy.test/api/mcp");
+    expect(stalled.cancelled(), "the stalled body was not cancelled").toBe(true);
+  });
+
+  /**
+   * The bound is on the gap between chunks, not on the whole read. A total
+   * bound generous enough for a large slow tool result would be too generous to
+   * bound a wedge; a gap bound is both. This body takes 5x the bound in total
+   * and must not be cut off.
+   */
+  it("does not cut off a large response that keeps arriving", async () => {
+    const slow = scriptedBody();
+    const { fetchImpl } = recordingFetch(
+      new Response(slow.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      timeoutMs: 40,
+    });
+
+    const pending = client.send(TOOL_CALL);
+    const payload = JSON.stringify({ jsonrpc: "2.0", id: 7, result: { ok: true } });
+    for (const character of payload) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      slow.push(character);
+    }
+    slow.close();
+
+    await expect(pending).resolves.toEqual({
+      jsonrpc: "2.0",
+      id: 7,
+      result: { ok: true },
+    });
+  });
+
+  it("cancels the stream of an error body that never finishes", async () => {
+    const stalled = scriptedBody();
+    const { fetchImpl } = recordingFetch(
+      new Response(stalled.body, { status: 500, statusText: "Server Error" }),
+    );
+    const client = new UpstreamClient({
+      url: URL,
+      apiKey: KEY,
+      fetchImpl,
+      bodyReadTimeoutMs: 20,
+    });
+
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+
+    expect(error.message).toContain("HTTP 500");
+    expect(
+      stalled.cancelled(),
+      "response.text() locks the body, so cancelling the locked body rejects and the read runs on",
+    ).toBe(true);
+  });
+});
+
+/**
+ * ACCEPTED 5. strip() survives for the strings we originate -- the platform's
+ * wording and the url itself. Subtraction is sound there and only there. Its
+ * span map has to be exact: mapping every character of a multibyte escape run
+ * to the whole run redacts unrelated text around the match. That fails closed,
+ * so it is not a leak, but it destroys the diagnostic the sink exists to keep.
+ */
+describe("UpstreamClient platform-error sanitising", () => {
+  async function messageFor(reason: string, apiKey: string): Promise<string> {
+    const fetchImpl = (async () => {
+      throw new TypeError(reason);
+    }) as unknown as typeof fetch;
+    const client = new UpstreamClient({ url: URL, apiKey, fetchImpl });
+    const error = (await client
+      .send(TOOL_CALL)
+      .catch((e: unknown) => e)) as UpstreamError;
+    return error.message;
+  }
+
+  // A one-character secret is the sharpest probe of the span map: what is under
+  // test is which escapes a match maps back to, not the match itself.
+  it("redacts only the escapes the match came from", async () => {
+    const message = await messageFor("before %61%62%C3%A9%63%64 after", "é");
+
+    expect(message).toContain("%61%62");
+    expect(message).toContain("%63%64");
+    expect(message).toContain("[redacted]");
+    expect(message).toContain("before");
+    expect(message).toContain("after");
+  });
+
+  // Subtraction lives on here and only here, so the encoding table lives on
+  // here too: what the construction can decline to read, the sink has to match.
+  it.each(FORMS)("redacts %s out of a platform error", async (_form, encoded) => {
+    const message = await messageFor(
+      `fetch failed for ${encoded}`,
+      AWKWARD_KEY,
+    );
+
+    expect(message).not.toContain(encoded);
+    expect(message).not.toContain(AWKWARD_KEY);
+    expect(message).toContain("[redacted]");
+    // Surgical: the rest of the platform's wording is the diagnostic.
+    expect(message).toContain("fetch failed for");
+  });
+
+  it("still redacts a key that overlaps itself", async () => {
+    const key = "A".repeat(64);
+    const message = await messageFor(`refused ${"A".repeat(127)} refused`, key);
+
+    expect(message).not.toContain("A".repeat(63));
+  });
+
+  /**
+   * A `%` that begins no escape is a literal, and the span map has to keep
+   * counting through it -- otherwise every span after it is off by one and the
+   * redaction lands on the wrong text. A secret sitting between a malformed
+   * escape and a trailing lone `%` is what makes this depend on the map at all:
+   * with nothing to redact, strip() returns the text untouched and any mapping
+   * at all would pass.
+   */
+  it("keeps counting through a malformed escape and a trailing percent", async () => {
+    const message = await messageFor("at 50%% load %zz %41 %", "A");
+
+    expect(message).toContain("at 50%% load %zz [redacted] %");
+  });
+
+  it("scrubs the whole reason before cutting it down", async () => {
+    const key = "sk-live-0123456789abcdef";
+    const message = await messageFor(`${"x".repeat(480)}${key} and more`, key);
+
+    expect(message).not.toContain("sk-live");
+    expect(message).toContain("[redacted]");
   });
 });

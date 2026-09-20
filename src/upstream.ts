@@ -7,8 +7,20 @@
  * Crispy exposes.
  */
 
-import { API_KEYS_URL } from "./config.js";
+import { API_KEYS_URL, DEFAULT_CRISPY_MCP_URL } from "./config.js";
 
+/**
+ * The path of the endpoint we ship. It is a constant of ours, so a message may
+ * print it; see endpointForMessage(). Any other path came from CRISPY_MCP_URL.
+ */
+const DEFAULT_ENDPOINT_PATH = new URL(DEFAULT_CRISPY_MCP_URL).pathname;
+
+/**
+ * The request's patience, and the same number twice: it bounds the wait for the
+ * response headers, and then it bounds the GAP between the body's chunks. A
+ * body that keeps arriving is never cut off however large it is; a body that
+ * stops arriving fails closed. See readBounded().
+ */
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
 /** Teardown happens on the way out, so it gets a far shorter leash. */
@@ -48,18 +60,63 @@ export interface UpstreamOptions {
   bodyReadTimeoutMs?: number;
 }
 
-/** What a message is allowed to show of an untrusted string. */
-const MAX_BODY_SNIPPET = 500;
+/**
+ * Subtraction is sound on a string WE originate and never on a string an
+ * upstream chooses.
+ *
+ * Everything below this line is the sink for our own strings: the platform's
+ * wording (undici quotes our url back at us) and the url itself. We know what
+ * is in them, so removing a secret from them leaves something meaningful.
+ *
+ * An upstream body gets the opposite treatment -- see detailFrom(). Three
+ * rounds of hardening a redactor against attacker-chosen bytes found a new
+ * encoding every time, because subtraction inside text somebody else wrote is
+ * a game the writer always moves last in. Messages are CONSTRUCTED out of
+ * allowed parts instead, so there is nothing left to defeat.
+ */
+
+/** What a message is allowed to show of a string we originate. */
+const MAX_PLATFORM_REASON = 500;
 
 /**
- * How much of an untrusted string is scrubbed before it is cut down to the
- * snippet. Scrubbing has to come first -- see snippet() -- but scrubbing is
- * linear in the text and an upstream body has no size limit. Cutting here is
- * safe only because this bound is so far beyond MAX_BODY_SNIPPET: a credential
- * straddling this cut loses its tail, but the prefix left behind sits 64 KiB
- * into the text and the snippet stops long before it.
+ * What a message is allowed to show of the one field lifted out of an upstream
+ * body. A Crispy error sentence sits well inside this; the cap is here because
+ * the field crossed the wire and an upstream can say anything.
  */
-const MAX_SCRUB_INPUT = 64 * 1024;
+const MAX_UPSTREAM_DETAIL = 300;
+
+/**
+ * The shortest run of a secret that is worth hiding on its own.
+ *
+ * F1 and F3 were both "63 characters of a 64-character key reach the message".
+ * Checking for the whole key only would hand the same prefix back the moment an
+ * upstream echoed a truncated one -- and truncating a credential before logging
+ * it is what a careful server does, so this is the likely case, not the exotic
+ * one. Sixteen characters is long enough not to fire on a shared key prefix
+ * like `sk-live-`, which any body explaining the key format will contain.
+ */
+const MIN_SECRET_RUN = 16;
+
+/** The reason phrase is bounded by the HTTP grammar. Bound it here too. */
+const MAX_STATUS_TEXT = 80;
+
+/** How much of a failed response's body is kept to look for that one field. */
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+
+/**
+ * Plain printable ascii, minus `%`.
+ *
+ * What passes this class cannot be a percent escape, a control sequence a
+ * terminal will act on, a bidi override, or a homoglyph. That is what makes the
+ * secret check in carriesSecret() sound where a redactor was not: inside this
+ * class the only reading left for a credential to hide under is form-encoding's
+ * `+` for a space, and that is one line to cover rather than an open list.
+ *
+ * A field that fails the class is dropped whole. It is not sanitised: sanitising
+ * is what leaves a remainder, and every bug the last three rounds found lived in
+ * a remainder.
+ */
+const PLAIN_TEXT = /^[ -$&-~]+$/;
 
 const REDACTED = "[redacted]";
 
@@ -73,8 +130,10 @@ const ESCAPE = /^%[0-9A-Fa-f]{2}/;
 
 const UTF8 = new TextDecoder("utf-8", { fatal: false });
 
+const BYTES = new TextEncoder();
+
 /**
- * Percent-decodes `text` and records, for every character of the result, the
+ * Percent-decodes `text` and records, for every code unit of the result, the
  * span of the original it came from.
  *
  * Enumerating encodings is a losing game. The list this replaces held the
@@ -89,8 +148,8 @@ const UTF8 = new TextDecoder("utf-8", { fatal: false });
  * body carries no hint which. The caller matches under both readings.
  *
  * One pass, not a fixed point: a doubly-encoded credential (`%2573`) is not
- * covered, and reaching one would take an upstream that encodes its own error
- * bodies twice.
+ * covered. That used to be a hole because upstream bodies came through here;
+ * they do not any more, and nothing we originate encodes itself twice.
  *
  * The span map is what makes any of this usable. A match is found in decoded
  * coordinates and has to be removed from the original, and the two do not line
@@ -104,49 +163,64 @@ function decodeWithSpans(
   const spans: Span[] = [];
 
   for (let i = 0; i < text.length; ) {
-    if (ESCAPE.test(text.slice(i, i + 3))) {
-      // A non-ASCII character arrives as several escapes in a row, so decode
-      // the whole run at once: `%C3%A9` is one character, not two.
-      const start = i;
-      const bytes: number[] = [];
-      while (ESCAPE.test(text.slice(i, i + 3))) {
-        bytes.push(Number.parseInt(text.slice(i + 1, i + 3), 16));
-        i += 3;
-      }
-      const run = UTF8.decode(new Uint8Array(bytes));
-
-      if (run.length === bytes.length) {
-        // One escape per character: each maps back to its own three.
-        for (let j = 0; j < run.length; j += 1) {
-          spans.push({ start: start + j * 3, end: start + j * 3 + 3 });
-        }
-      } else {
-        // Bytes and characters do not line up. Widening is the safe way to be
-        // wrong: every character points at the whole run, so a match anywhere
-        // in it takes all of it.
-        for (let j = 0; j < run.length; j += 1) {
-          spans.push({ start, end: i });
-        }
-      }
-      decoded += run;
+    if (!ESCAPE.test(text.slice(i, i + 3))) {
+      decoded += plusAsSpace && text[i] === "+" ? " " : text[i];
+      spans.push({ start: i, end: i + 1 });
+      i += 1;
       continue;
     }
 
-    decoded += plusAsSpace && text[i] === "+" ? " " : text[i];
-    spans.push({ start: i, end: i + 1 });
-    i += 1;
+    // A non-ascii character arrives as several escapes in a row and only the
+    // decoder knows how many, so feed it one byte at a time and attribute what
+    // it emits to exactly the escapes consumed since it last emitted anything.
+    //
+    // Pointing every character of the run at the whole run instead fails
+    // closed -- a match anywhere takes all of it -- but it destroys the text
+    // around the match: matching `e` in `%61%62%C3%A9%63%64` redacted the
+    // encoded `abecd` entire. Losing the diagnostic to protect the part of it
+    // that was never at risk is still a loss.
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    let pending = i;
+
+    const attribute = (out: string): void => {
+      if (out === "") {
+        return;
+      }
+      // One span per code unit, not per code point: a match is found with
+      // indexOf, whose indices are code units, and an emoji is two of them.
+      for (let unit = 0; unit < out.length; unit += 1) {
+        spans.push({ start: pending, end: i });
+      }
+      decoded += out;
+      pending = i;
+    };
+
+    while (ESCAPE.test(text.slice(i, i + 3))) {
+      const byte = Number.parseInt(text.slice(i + 1, i + 3), 16);
+      i += 3;
+      attribute(decoder.decode(new Uint8Array([byte]), { stream: true }));
+    }
+    // An incomplete sequence at the end of the run flushes as U+FFFD.
+    attribute(decoder.decode());
   }
 
   return { decoded, spans };
 }
 
-/** Every index at which `needle` occurs in `haystack`. */
+/**
+ * Every index at which `needle` occurs in `haystack`, overlaps included.
+ *
+ * Advancing by the needle's length instead skipped every occurrence that began
+ * inside the one before it, so a self-overlapping key left its tail behind:
+ * 127 `A`s against a 64-`A` key redacted the first 64 and printed 63. Spans are
+ * merged afterwards, so overlapping hits cost nothing.
+ */
 function occurrences(haystack: string, needle: string): number[] {
   const found: number[] = [];
   for (
     let at = haystack.indexOf(needle);
     at !== -1;
-    at = haystack.indexOf(needle, at + needle.length)
+    at = haystack.indexOf(needle, at + 1)
   ) {
     found.push(at);
   }
@@ -178,6 +252,22 @@ function redactSpans(text: string, spans: Span[]): string {
   return out + text.slice(cursor);
 }
 
+/**
+ * Every window of `secret` long enough to be worth hiding on its own, so that
+ * finding one of them is finding the secret. A secret no longer than the window
+ * is its own only window.
+ */
+function runsOf(secret: string): readonly string[] {
+  if (secret.length <= MIN_SECRET_RUN) {
+    return [secret];
+  }
+  const runs: string[] = [];
+  for (let at = 0; at + MIN_SECRET_RUN <= secret.length; at += 1) {
+    runs.push(secret.slice(at, at + MIN_SECRET_RUN));
+  }
+  return runs;
+}
+
 /** Dedupes and drops the empty string. Order is irrelevant: spans are merged. */
 function secretsOf(...secrets: string[]): readonly string[] {
   return [...new Set(secrets.filter((secret) => secret !== ""))];
@@ -188,6 +278,13 @@ function secretsOf(...secrets: string[]): readonly string[] {
  * both readings of its decoded form. All three passes are needed: the decoded
  * forms catch a credential that was encoded on the way in, and the raw pass
  * catches a secret that itself contains a `%` or a `+`, which decoding rewrites.
+ *
+ * Nothing is cut before this runs. Cutting first is what round 6 found -- a
+ * credential straddling the cut lost its tail, and half a credential matches
+ * nothing a whole-key search looks for -- and cutting at a bound far past the
+ * snippet was no better, because redaction COMPRESSES: 1023 adjacent keys merge
+ * into one `[redacted]` and pull the 64-KiB mark back inside the snippet. The
+ * only safe order is scrub everything, then cut.
  */
 function strip(text: string, secrets: readonly string[]): string {
   if (secrets.length === 0 || text === "") {
@@ -217,30 +314,56 @@ function strip(text: string, secrets: readonly string[]): string {
   return redactSpans(text, hits);
 }
 
-/**
- * Whether the raw endpoint url is itself a secret.
- *
- * It is, but only when sanitising it actually takes something away. undici
- * quotes the raw url back at us -- "Failed to parse URL from <the raw url>",
- * query and all -- so a url carrying userinfo, a query or a fragment must not
- * reach a message through any channel. A url carrying none of those *is* its
- * own sanitised form, and calling it a secret then redacts the endpoint out of
- * every body that legitimately names it: it destroys the diagnostic to protect
- * nothing. A url that will not parse is the worst case, not the safe one --
- * nothing could be stripped out of it, so all of it is a secret.
- */
-function carriesCredential(url: string): boolean {
+/** The one field a message may quote out of a JSON error body, or nothing. */
+function errorFieldOf(text: string): string | undefined {
+  let parsed: unknown;
   try {
-    const parsed = new URL(url);
-    return (
-      parsed.username !== "" ||
-      parsed.password !== "" ||
-      parsed.search !== "" ||
-      parsed.hash !== ""
-    );
+    parsed = JSON.parse(text) as unknown;
   } catch {
-    return true;
+    return undefined;
   }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+
+  // OBSERVED 2026-09-20, POST https://crispy.sh/api/mcp with a bad bearer:
+  // {"error":"Invalid API key. ...","retryable":false,"suggestion":"..."}.
+  // The same endpoint also speaks JSON-RPC, whose error is an object with a
+  // message. Those are the two shapes of one field, not two fields.
+  const error = (parsed as { error?: unknown }).error;
+  if (typeof error === "string") {
+    return error;
+  }
+  if (typeof error === "object" && error !== null) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") {
+      return message;
+    }
+  }
+
+  return undefined;
+}
+
+/** Joins what was retained of a body. */
+function concatenate(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
+}
+
+/** What a bounded read of a response body came back with. */
+interface BodyRead {
+  /** What was retained, decoded. Not necessarily the whole body. */
+  text: string;
+  /** Byte length of everything that arrived, retained or not. */
+  bytes: number;
+  /** False if the read hit its deadline or its retention cap. */
+  complete: boolean;
 }
 
 export class UpstreamClient {
@@ -256,11 +379,14 @@ export class UpstreamClient {
    */
   private readonly safeUrl: string;
 
-  /** The api key alone. Sanitises the url itself; see snippet(). */
+  /** The api key alone. Sanitises the url itself; see endpointForMessage(). */
   private readonly keySecrets: readonly string[];
 
-  /** Everything that may not appear in a message. See snippet(). */
+  /** Everything that may not appear in a message. */
   private readonly secrets: readonly string[];
+
+  /** The runs of those secrets that carriesSecret() rejects a string for. */
+  private readonly secretRuns: readonly string[];
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
   private readonly teardownTimeoutMs: number;
@@ -287,10 +413,21 @@ export class UpstreamClient {
     this.apiKey = options.apiKey;
     this.keySecrets = secretsOf(options.apiKey);
     this.safeUrl = this.endpointForMessage(options.url);
+    // The raw url is a secret exactly when the safe url is not the raw url.
+    //
+    // undici quotes the raw url back at us -- "Failed to parse URL from <the
+    // raw url>" -- so anything endpointForMessage() dropped would walk back in
+    // through the platform's own wording. Deriving that from the reduction
+    // itself, rather than from a second predicate listing the parts that can
+    // carry a credential, is what closes the gap: the old predicate knew about
+    // userinfo, query and fragment and did not know a path segment can be a
+    // credential too. A url that is already its own safe form is not a secret,
+    // so a message that legitimately names it is not flattened.
     this.secrets = secretsOf(
-      ...(carriesCredential(options.url) ? [options.url] : []),
+      ...(this.safeUrl === options.url ? [] : [options.url]),
       options.apiKey,
     );
+    this.secretRuns = this.secrets.flatMap((secret) => runsOf(secret));
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.teardownTimeoutMs =
@@ -300,59 +437,159 @@ export class UpstreamClient {
   }
 
   /**
-   * The sink, and the only way an untrusted string may enter a message: a
-   * platform error, an upstream body, a status line, a header. It scrubs and
-   * then cuts down to a snippet, and that order is the whole of one bug --
-   * cutting first split a credential that straddled the boundary, and half a
-   * credential matches nothing a whole-key search looks for, so the surviving
-   * prefix went to stderr and into the JSON-RPC error. Cutting after scrubbing
-   * can only ever land on text that is already safe.
+   * The sink for a string the PLATFORM worded for us, and the only one left.
    *
    * Sanitising the url where *we* interpolate it is not enough, because we are
-   * not the only one who can put it in a message. undici rejects an
-   * unparseable url with "Failed to parse URL from <the raw url>", query and
-   * all, and that wording becomes the failure reason we go on to quote. So a
-   * url that carries anything is a secret exactly as the key is: nothing
-   * derived from it may enter a message. See carriesCredential().
+   * not the only one who can put it in a message: undici rejects an unparseable
+   * url with "Failed to parse URL from <the raw url>", query and all, and that
+   * wording becomes the failure reason we go on to quote. bridge.ts copies
+   * whatever comes out of here to stderr and into the JSON-RPC error, and
+   * bridge.ts holds neither the key nor the url, so it cannot sanitise a thing.
    *
-   * This runs on the untrusted fragments, never on the assembled message:
+   * Scrub the whole string, then cut. Never the other way round: a credential
+   * straddling the cut loses its tail, and half a credential matches nothing a
+   * whole-key search looks for. There is no pre-cut here at all now -- the only
+   * strings that reach this are ours, bounded by the url we were configured
+   * with, so there is nothing to bound that scrubbing them would not already.
+   *
+   * This runs on the untrusted fragment, never on the assembled message:
    * safeUrl is the sanitised url and is allowed to stay.
    */
-  private snippet(text: string): string {
-    const scrubbed = strip(
-      text.length > MAX_SCRUB_INPUT ? text.slice(0, MAX_SCRUB_INPUT) : text,
-      this.secrets,
-    );
-    return scrubbed.length > MAX_BODY_SNIPPET
-      ? `${scrubbed.slice(0, MAX_BODY_SNIPPET)}...`
+  private platformReason(text: string): string {
+    const scrubbed = strip(text, this.secrets);
+    return scrubbed.length > MAX_PLATFORM_REASON
+      ? `${scrubbed.slice(0, MAX_PLATFORM_REASON)}...`
       : scrubbed;
   }
 
   /**
-   * Reduces the endpoint to the part that identifies it and drops the parts
-   * that can carry a credential. Matching the key as a string is not enough:
-   * a key in a query component is percent-encoded, so `?api_key=a%20b` shares
-   * no substring with the key `a b` and survives a literal match untouched.
+   * Whether a string that has already passed PLAIN_TEXT carries a secret.
+   *
+   * This is a rejection, not a subtraction: the caller drops the whole string.
+   * That is the difference from the redactor this replaces -- a redactor keeps
+   * a remainder and every round found a new way to get something into it,
+   * whereas there is no remainder here to get wrong. The class check has ruled
+   * out percent escapes already, so the only reading left that a credential
+   * could hide under is form-encoding's `+` for a space.
+   *
+   * A long enough RUN of a secret is treated as the secret; see MIN_SECRET_RUN.
+   */
+  private carriesSecret(text: string): boolean {
+    const readings = [text, text.replaceAll("+", " ")];
+    return this.secretRuns.some((run) =>
+      readings.some((reading) => reading.includes(run)),
+    );
+  }
+
+  /**
+   * The ONLY thing an upstream body may contribute to a message.
+   *
+   * No raw body text reaches a message. One field is lifted out of a JSON body
+   * -- see errorFieldOf() -- and it is kept only if it parses, only if it is
+   * plain printable text, and only if it carries no secret. Anything else is a
+   * byte count and nothing more: unparseable, wrong shape, binary, truncated,
+   * over-long.
+   *
+   * The checks run on the WHOLE field and the cut comes last. Capping first and
+   * checking the cap is round 6's bug wearing a new hat: a key straddling the
+   * cap would lose its tail and the prefix would sail through the check.
+   */
+  private detailFrom(read: BodyRead): string {
+    if (read.bytes === 0) {
+      return "";
+    }
+
+    const unshown = `<${read.bytes} bytes, not shown>`;
+    if (!read.complete) {
+      return unshown;
+    }
+
+    const field = errorFieldOf(read.text.trim())?.trim();
+    if (
+      field === undefined ||
+      !PLAIN_TEXT.test(field) ||
+      this.carriesSecret(field)
+    ) {
+      return unshown;
+    }
+
+    return field.length > MAX_UPSTREAM_DETAIL
+      ? `${field.slice(0, MAX_UPSTREAM_DETAIL)}...`
+      : field;
+  }
+
+  /**
+   * `HTTP <code>`, plus the reason phrase when the wire sent one we are willing
+   * to repeat. The code is a number and it is ours; the phrase crossed the wire,
+   * so it gets the same class check and the same all-or-nothing drop the body
+   * field gets. A misrouted endpoint is undiagnosable without the code, so the
+   * code survives whatever happens to the phrase.
+   */
+  private statusLine(response: Response): string {
+    const phrase = response.statusText.trim();
+    const shown =
+      phrase === "" || !PLAIN_TEXT.test(phrase) || this.carriesSecret(phrase)
+        ? ""
+        : phrase.length > MAX_STATUS_TEXT
+          ? `${phrase.slice(0, MAX_STATUS_TEXT)}...`
+          : phrase;
+
+    return shown === ""
+      ? `HTTP ${response.status}`
+      : `HTTP ${response.status} ${shown}`;
+  }
+
+  /**
+   * The endpoint as a message is allowed to name it: the origin, plus at most
+   * the SHAPE of the path.
+   *
+   * The rule, in full:
+   *   - userinfo, query and fragment: never.
+   *   - the path: printed only when it is the default endpoint's path, which
+   *     is a constant of ours and therefore carries nothing. Any other path is
+   *     reduced to its segment count.
+   *   - a url that will not parse: not printed at all. Name the setting.
+   *
+   * CRISPY_MCP_URL is user-supplied and unrestricted, and a path segment can be
+   * a credential as easily as a query component can:
+   * `https://crispy.test/token/hunter2/api/mcp` put `hunter2` into a diagnostic
+   * that goes to stderr AND back to the client as a JSON-RPC error. Matching
+   * the api key as a string is no defence -- a path credential need not be the
+   * api key at all -- so no arbitrary path segment is printed, ever.
    *
    * Parsing is defensive on purpose. This runs on the error path, so a url the
    * URL parser rejects must produce a worse message, never a thrown one. Worse
    * means less: a url that will not parse is the one this function can strip
-   * nothing out of, so echoing it -- even through the sink -- prints back
-   * whatever credential it carries. Name the setting instead. That is enough
-   * to find the problem, since the default url always parses, so an
-   * unparseable one can only have come from CRISPY_MCP_URL.
+   * nothing out of, so echoing it prints back whatever credential it carries.
+   * Naming the setting is enough to find the problem, since the default url
+   * always parses -- an unparseable one can only have come from CRISPY_MCP_URL.
    */
   private endpointForMessage(url: string): string {
+    const unnameable =
+      "the configured endpoint (CRISPY_MCP_URL is not a valid url)";
+
+    let parsed: URL;
     try {
-      const parsed = new URL(url);
-      parsed.username = "";
-      parsed.password = "";
-      parsed.search = "";
-      parsed.hash = "";
-      return strip(parsed.toString(), this.keySecrets);
+      parsed = new URL(url);
     } catch {
-      return "the configured endpoint (CRISPY_MCP_URL is not a valid url)";
+      return unnameable;
     }
+
+    // A scheme with no origin of its own identifies nothing, and "null" would
+    // read as a hostname called null.
+    if (parsed.origin === "null" || parsed.origin === "") {
+      return unnameable;
+    }
+
+    const segments = parsed.pathname.split("/").filter((part) => part !== "");
+    const shape =
+      segments.length === 0
+        ? ""
+        : parsed.pathname === DEFAULT_ENDPOINT_PATH
+          ? parsed.pathname
+          : `/<${segments.length} path segment${segments.length === 1 ? "" : "s"}>`;
+
+    return strip(`${parsed.origin}${shape}`, this.keySecrets);
   }
 
   private headers(): Record<string, string> {
@@ -390,7 +627,7 @@ export class UpstreamClient {
       }
       const reason = error instanceof Error ? error.message : String(error);
       throw new UpstreamError(
-        `The exchange with Crispy at ${this.safeUrl} failed: ${this.snippet(reason)}`,
+        `The exchange with Crispy at ${this.safeUrl} failed: ${this.platformReason(reason)}`,
         "network",
       );
     }
@@ -433,7 +670,7 @@ export class UpstreamClient {
       }
       const reason = error instanceof Error ? error.message : String(error);
       throw new UpstreamError(
-        `Could not reach Crispy at ${this.safeUrl}: ${this.snippet(reason)}`,
+        `Could not reach Crispy at ${this.safeUrl}: ${this.platformReason(reason)}`,
         "network",
       );
     } finally {
@@ -538,15 +775,13 @@ export class UpstreamClient {
       this.invalidateSession();
     }
 
-    const body = this.snippet((await this.safeText(response)).trim());
+    const body = this.detailFrom(await this.safeRead(response));
+    const status = this.statusLine(response);
 
     if (expired) {
       // A wrong CRISPY_MCP_URL, a bad deploy and a genuinely dropped session
       // all look like this. The advice is right for the common case, but the
       // status has to survive or a misrouted endpoint is undiagnosable.
-      const status = this.snippet(
-        `HTTP ${response.status} ${response.statusText}`.trim(),
-      );
       return new UpstreamError(
         [
           `The Crispy session expired: ${status} -- the server no longer recognises this session id.`,
@@ -573,9 +808,7 @@ export class UpstreamClient {
     }
 
     return new UpstreamError(
-      this.snippet(
-        `Crispy returned HTTP ${response.status} ${response.statusText}`.trim(),
-      ) + (body === "" ? "" : `: ${body}`),
+      `Crispy returned ${status}${body === "" ? "" : `: ${body}`}`,
       "http",
     );
   }
@@ -629,35 +862,98 @@ export class UpstreamClient {
   }
 
   /**
+   * Reads a response body under a bound of its own, owning the stream reader.
+   *
+   * Owning the reader is the point. `response.text()` locks the body, so the
+   * `response.body.cancel()` that used to run at the deadline rejected on a
+   * locked stream, the rejection was swallowed, and the original read carried
+   * on holding the socket. Cancelling through a reader we hold actually
+   * cancels: the pending read resolves done and the stream is released.
+   *
+   * `perChunk` chooses what the deadline measures. On the happy path it is the
+   * GAP between chunks, because a total bound generous enough for a large slow
+   * tool result would be far too generous to bound a wedge, while a gap bound
+   * is both: a response that keeps arriving is never cut off, and one that
+   * stops arriving is. On the error path it is the whole read, because that
+   * body is a diagnostic nicety and no caller waiting for an answer should pay
+   * more than a moment for one.
+   */
+  private async readBounded(
+    response: Response,
+    bound: { ms: number; perChunk: boolean },
+    retainBytes = Number.POSITIVE_INFINITY,
+  ): Promise<BodyRead> {
+    const stream = response.body;
+    if (stream === null) {
+      // Nothing to read from and nothing to bound: a bodyless response.
+      const text = await response.text();
+      return { text, bytes: BYTES.encode(text).length, complete: true };
+    }
+
+    const reader = stream.getReader();
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (): void => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        expired = true;
+        void reader.cancel().catch(() => undefined);
+      }, bound.ms);
+    };
+
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    let retained = 0;
+
+    arm();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value !== undefined) {
+          bytes += value.byteLength;
+          if (retained < retainBytes) {
+            const room = retainBytes - retained;
+            const kept =
+              value.byteLength <= room ? value : value.subarray(0, room);
+            chunks.push(kept);
+            retained += kept.byteLength;
+          }
+          if (bound.perChunk) {
+            arm();
+          }
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+
+    return {
+      text: UTF8.decode(concatenate(chunks, retained)),
+      bytes,
+      complete: !expired && retained === bytes,
+    };
+  }
+
+  /**
    * A failed response's body, for a diagnostic and nothing else. Bounded in its
    * own right: the request timeout was cleared the moment the headers arrived,
    * so a body stream that never closes would hang this read for ever. A missing
    * detail makes a worse message; a read that never returns makes no message at
-   * all.
+   * all. Retention is bounded too -- past MAX_DIAGNOSTIC_BYTES there is no
+   * error field worth finding, and the message falls back to the byte count.
    */
-  private async safeText(response: Response): Promise<string> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
+  private async safeRead(response: Response): Promise<BodyRead> {
     try {
-      const reading = response.text();
-      // Past the deadline nobody awaits `reading` any more, so its rejection
-      // needs an owner of its own or it surfaces as an unhandled one.
-      void reading.catch(() => undefined);
-
-      const deadline = new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), this.bodyReadTimeoutMs);
-      });
-
-      const text = await Promise.race([reading, deadline]);
-      if (text === null) {
-        // Let the socket go; nothing is going to read the rest of it.
-        void response.body?.cancel().catch(() => undefined);
-        return "";
-      }
-      return text;
+      return await this.readBounded(
+        response,
+        { ms: this.bodyReadTimeoutMs, perChunk: false },
+        MAX_DIAGNOSTIC_BYTES,
+      );
     } catch {
-      return "";
-    } finally {
-      clearTimeout(timer);
+      return { text: "", bytes: 0, complete: false };
     }
   }
 
@@ -669,7 +965,24 @@ export class UpstreamClient {
     const contentType = response.headers.get("content-type") ?? "";
     // Unwrapped on purpose: a torn body rejects here with a platform error, and
     // send() is what makes sure nothing leaves this client unsanitised.
-    const text = await response.text();
+    const read = await this.readBounded(response, {
+      ms: this.timeoutMs,
+      perChunk: true,
+    });
+
+    // A 2xx whose body hangs used to never settle: this read had no deadline of
+    // its own and the request timer was cleared when the headers arrived. That
+    // is the wedge an expired session used to cause, reached through a
+    // different door, and shipping a wedge inside the fix for a wedge is not
+    // acceptable.
+    if (!read.complete) {
+      throw new UpstreamError(
+        `Crispy stopped sending the response: the body from ${this.safeUrl} went quiet for ${this.timeoutMs}ms, so the read was abandoned.`,
+        "network",
+      );
+    }
+
+    const text = read.text;
 
     if (text.trim() === "") {
       return null;
@@ -689,8 +1002,10 @@ export class UpstreamClient {
     try {
       return JSON.parse(text) as unknown;
     } catch {
+      // Constructed, not scrubbed: this is an upstream body, so nothing of it
+      // enters the message but its size. See detailFrom().
       throw new UpstreamError(
-        `Crispy returned a response that is not JSON: ${this.snippet(text)}`,
+        `Crispy returned a response that is not JSON: <${read.bytes} bytes, not shown>`,
         "protocol",
       );
     }
