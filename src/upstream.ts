@@ -11,7 +11,15 @@ import { API_KEYS_URL } from "./config.js";
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
-export type UpstreamErrorKind = "auth" | "http" | "network" | "protocol";
+/** Teardown happens on the way out, so it gets a far shorter leash. */
+export const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
+
+export type UpstreamErrorKind =
+  | "auth"
+  | "http"
+  | "network"
+  | "protocol"
+  | "session";
 
 export class UpstreamError extends Error {
   readonly kind: UpstreamErrorKind;
@@ -28,6 +36,7 @@ export interface UpstreamOptions {
   apiKey: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  teardownTimeoutMs?: number;
 }
 
 const MAX_BODY_SNIPPET = 500;
@@ -37,6 +46,7 @@ export class UpstreamClient {
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly teardownTimeoutMs: number;
 
   private sessionId: string | undefined;
   private protocolVersion: string | undefined;
@@ -46,6 +56,8 @@ export class UpstreamClient {
     this.apiKey = options.apiKey;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.teardownTimeoutMs =
+      options.teardownTimeoutMs ?? DEFAULT_TEARDOWN_TIMEOUT_MS;
   }
 
   /** Strips the api key out of anything on its way to a log or an error. */
@@ -74,6 +86,7 @@ export class UpstreamClient {
   }
 
   async send(message: unknown): Promise<unknown | null> {
+    const sentSessionId = this.sessionId;
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort(new Error("timeout"));
@@ -109,7 +122,7 @@ export class UpstreamClient {
     }
 
     if (!response.ok) {
-      throw await this.httpError(response);
+      throw await this.httpError(response, sentSessionId);
     }
 
     const body = await this.readBody(response);
@@ -131,8 +144,29 @@ export class UpstreamClient {
     }
   }
 
-  private async httpError(response: Response): Promise<UpstreamError> {
+  private async httpError(
+    response: Response,
+    sentSessionId: string | undefined,
+  ): Promise<UpstreamError> {
     const body = this.redact((await this.safeText(response)).trim());
+
+    // The spec lets the server drop a session whenever it likes and answer
+    // anything still carrying that id with a 404. Retrying is not ours to do:
+    // only the client can re-run initialize, so drop the dead state and say so.
+    if (response.status === 404 && sentSessionId !== undefined) {
+      this.sessionId = undefined;
+      this.protocolVersion = undefined;
+      return new UpstreamError(
+        [
+          "The Crispy session expired: the server no longer recognises this session id.",
+          "Reconnect your MCP client so it runs initialize again.",
+          body === "" ? "" : `Upstream said: ${body}`,
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+        "session",
+      );
+    }
 
     if (response.status === 401 || response.status === 403) {
       return new UpstreamError(
@@ -152,6 +186,38 @@ export class UpstreamClient {
         (body === "" ? "" : `: ${body}`),
       "http",
     );
+  }
+
+  /**
+   * Tells Crispy the session is finished, per the Streamable HTTP spec's
+   * DELETE. Best effort by design: shutdown must not be blocked by a server
+   * that is slow, unreachable, or answers 405 because it has no teardown.
+   */
+  async endSession(): Promise<void> {
+    const sessionId = this.sessionId;
+    if (sessionId === undefined) {
+      return;
+    }
+
+    const headers = this.headers();
+    this.sessionId = undefined;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(new Error("timeout"));
+    }, this.teardownTimeoutMs);
+
+    try {
+      await this.fetchImpl(this.url, {
+        method: "DELETE",
+        headers,
+        signal: controller.signal,
+      });
+    } catch {
+      // Nothing to do and nobody to tell: the process is on its way out.
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async safeText(response: Response): Promise<string> {

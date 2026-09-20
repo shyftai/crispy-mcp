@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { createServer, type IncomingMessage } from "node:http";
+import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -109,4 +111,114 @@ describe("crispy-mcp binary", () => {
     expect(result.code).toBe(0);
     expect(`${result.stdout}${result.stderr}`).not.toContain(KEY);
   });
+});
+
+/**
+ * A stand-in Crispy on loopback. It hands out a session id on initialize and
+ * records the DELETE the bridge is expected to send on the way out. Nothing
+ * here leaves the machine.
+ */
+function fakeCrispy(sessionId: string) {
+  const deleted: Array<IncomingMessage> = [];
+  let onDelete: (() => void) | undefined;
+
+  const server = createServer((req, res) => {
+    if (req.method === "DELETE") {
+      deleted.push(req);
+      res.writeHead(204).end();
+      onDelete?.();
+      return;
+    }
+
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "mcp-session-id": sessionId,
+      });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { protocolVersion: "2025-06-18" },
+        }),
+      );
+    });
+  });
+
+  return {
+    deleted,
+    listen: (): Promise<string> =>
+      new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+          const { port } = server.address() as AddressInfo;
+          resolve(`http://127.0.0.1:${port}/api/mcp`);
+        });
+      }),
+    close: (): Promise<void> =>
+      new Promise((resolve) => server.close(() => resolve())),
+    waitForDelete: (ms: number): Promise<boolean> =>
+      new Promise((resolve) => {
+        if (deleted.length > 0) {
+          resolve(true);
+          return;
+        }
+        const timer = setTimeout(() => resolve(false), ms);
+        onDelete = () => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+      }),
+  };
+}
+
+describe("crispy-mcp shutdown", () => {
+  it("ends the Crispy session with a DELETE before it exits on SIGTERM", async () => {
+    const crispy = fakeCrispy("sess-cli-1");
+    const url = await crispy.listen();
+
+    const child = spawn(process.execPath, [BIN], {
+      env: { PATH: process.env.PATH ?? "", CRISPY_API_KEY: KEY, CRISPY_MCP_URL: url },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    try {
+      const initialized = new Promise<void>((resolve) => {
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          if (chunk.includes("protocolVersion")) {
+            resolve();
+          }
+        });
+      });
+
+      child.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "test", version: "0.0.0" },
+          },
+        })}\n`,
+      );
+      await initialized;
+
+      const exited = new Promise<void>((resolve) =>
+        child.on("close", () => resolve()),
+      );
+      child.kill("SIGTERM");
+
+      expect(await crispy.waitForDelete(10_000)).toBe(true);
+      expect(crispy.deleted[0].headers["mcp-session-id"]).toBe("sess-cli-1");
+      expect(crispy.deleted[0].headers.authorization).toBe(`Bearer ${KEY}`);
+
+      await exited;
+    } finally {
+      child.kill("SIGKILL");
+      await crispy.close();
+    }
+  }, 20_000);
 });

@@ -12,6 +12,7 @@ import { UpstreamError, type UpstreamClient } from "./upstream.js";
 /** JSON-RPC implementation-defined server errors. */
 export const AUTH_ERROR_CODE = -32001;
 export const UPSTREAM_ERROR_CODE = -32000;
+export const SESSION_ERROR_CODE = -32002;
 
 /** The part of the SDK transport interface the bridge needs. */
 export interface BridgeTransport {
@@ -35,9 +36,17 @@ function idOf(message: unknown): string | number | null {
 }
 
 function codeFor(error: unknown): number {
-  return error instanceof UpstreamError && error.kind === "auth"
-    ? AUTH_ERROR_CODE
-    : UPSTREAM_ERROR_CODE;
+  if (!(error instanceof UpstreamError)) {
+    return UPSTREAM_ERROR_CODE;
+  }
+  switch (error.kind) {
+    case "auth":
+      return AUTH_ERROR_CODE;
+    case "session":
+      return SESSION_ERROR_CODE;
+    default:
+      return UPSTREAM_ERROR_CODE;
+  }
 }
 
 export function attachBridge(options: BridgeOptions): void {

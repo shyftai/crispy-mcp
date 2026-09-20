@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { attachBridge } from "../src/bridge";
+import { SESSION_ERROR_CODE, attachBridge } from "../src/bridge";
 import { UpstreamClient } from "../src/upstream";
 
 const KEY = "fake-test-key-bridge-only";
@@ -181,6 +181,31 @@ describe("attachBridge", () => {
 
     expect(transport.sent).toEqual([]);
     expect(logs.join("\n")).toMatch(/missing or invalid/i);
+  });
+
+  it("gives an expired session its own error code so the client can tell it apart", async () => {
+    const { transport } = setup((_url, init) =>
+      new Headers(init.headers as HeadersInit).get("mcp-session-id") === null
+        ? jsonResponse(
+            { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18" } },
+            200,
+            { "mcp-session-id": "sess-gone" },
+          )
+        : jsonResponse({ error: "session not found" }, 404),
+    );
+
+    await transport.receive({ jsonrpc: "2.0", id: 1, method: "initialize" });
+    await transport.receive(TOOL_CALL);
+
+    expect(transport.sent).toHaveLength(2);
+    const response = transport.sent[1] as {
+      id: number;
+      error: { code: number; message: string };
+    };
+    expect(response.id).toBe(42);
+    expect(response.error.code).toBe(SESSION_ERROR_CODE);
+    expect(SESSION_ERROR_CODE).toBe(-32002);
+    expect(response.error.message).toMatch(/expired/i);
   });
 
   it("never writes the api key to a log line or an error message", async () => {
