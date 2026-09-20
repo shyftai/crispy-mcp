@@ -1,6 +1,6 @@
 {
   "name": "crispy-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "mcpName": "sh.crispy/crispy",
   "description": "Local stdio MCP bridge for Crispy, the LinkedIn MCP server. Proxies every request to https://crispy.sh/api/mcp for clients that cannot send custom headers.",
   "keywords": [

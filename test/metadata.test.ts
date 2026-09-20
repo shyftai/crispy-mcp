@@ -20,6 +20,7 @@ interface PackageJson {
 
 interface ServerJson {
   name: string;
+  version: string;
   packages?: Array<{
     registryType: string;
     identifier: string;
@@ -55,5 +56,22 @@ describe("registry manifests", () => {
       npmPackage?.version,
       "server.json npm package version is stale: bump it with package.json version",
     ).toBe(pkg.version);
+  });
+
+  it("keeps the server.json record version in step with package.json", () => {
+    expect(
+      server.version,
+      "server.json version is the registry record version: bump it with package.json version",
+    ).toBe(pkg.version);
+  });
+
+  // npm versions are immutable. 1.0.0 shipped on 2026-09-17 without `mcpName`,
+  // so the registry can never verify ownership from that tarball: the marker
+  // only reaches npm in a version that has not been published yet.
+  it("is past the 1.0.0 that shipped without the mcpName marker", () => {
+    expect(
+      pkg.version,
+      "crispy-mcp@1.0.0 is already on npm and immutable; mcpName needs a new version",
+    ).not.toBe("1.0.0");
   });
 });
