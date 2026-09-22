@@ -179,10 +179,47 @@ VS Code uses `servers` instead of `mcpServers`, with the same `command`, `args` 
 | --- | --- | --- |
 | API key | `CRISPY_API_KEY` env var, or `--api-key <key>` | required, no default |
 | Endpoint | `CRISPY_MCP_URL` env var | `https://crispy.sh/api/mcp` |
+| Error detail | `CRISPY_MCP_UNSAFE_ERROR_DETAIL` env var, exactly `1` | off — see below |
 
 Requires Node 18 or newer. Start it with no key and it exits non-zero, naming both ways to supply one and pointing at https://crispy.sh/dashboard/api-keys.
 
 Your key is sent to Crispy and nowhere else. It is never written to a log line or into an error message, even if the upstream response happens to echo it back.
+
+### What an error message may contain
+
+When a request fails, the bridge builds the message out of four things and nothing else:
+
+- the numeric HTTP status code,
+- the byte length of the response body,
+- its own fixed wording,
+- the endpoint, reduced to its origin and the *shape* of its path.
+
+So a failed call reads `Crispy returned HTTP 500: <54 bytes, not shown>`.
+
+Not a byte of the response body or the HTTP reason phrase appears, however harmless it looks. Those are strings the server on the other end chooses, and any string can carry a credential in *some* printable encoding — base64, hex, `&#65;` entities. Filtering for the encodings somebody thought of is a game whose other player moves last. The bridge does not play it: these messages go to stderr *and* back to your MCP client as a JSON-RPC error, so it says only what it composed itself.
+
+### `CRISPY_MCP_UNSAFE_ERROR_DETAIL`
+
+That costs you a real diagnostic. `rate limit exceeded` from Crispy's own API becomes a byte count, and a 400 you are trying to debug becomes a number. Set `CRISPY_MCP_UNSAFE_ERROR_DETAIL=1` to get it back:
+
+```json
+{
+  "mcpServers": {
+    "crispy": {
+      "command": "npx",
+      "args": ["-y", "crispy-mcp"],
+      "env": {
+        "CRISPY_API_KEY": "YOUR_API_KEY",
+        "CRISPY_MCP_UNSAFE_ERROR_DETAIL": "1"
+      }
+    }
+  }
+}
+```
+
+**`UNSAFE` is not decoration.** With it on, whatever the upstream put in the response body goes onto stderr and into your client's error field. If that server reflects your API key back — a proxy logging the `Authorization` header, a debug build echoing the request — your key lands wherever your client writes its errors. The bridge still subtracts the key from the text on a **best-effort** basis, and best-effort is the honest word for it: it catches a key echoed verbatim and is defeated by any encoding of one. Do not treat it as a safety net.
+
+Only the exact value `1` turns it on. `true`, `yes`, `on` and `0` all leave it off, so it cannot be enabled by a truthy string pasted into a config. It changes nothing else: the endpoint is still reduced, the key is still never in a header dump, and every other bound is unchanged.
 
 ### Why it is a proxy and not a reimplementation
 

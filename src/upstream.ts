@@ -7,11 +7,59 @@
  * Crispy exposes.
  */
 
-import { API_KEYS_URL } from "./config.js";
+import { API_KEYS_URL, DEFAULT_CRISPY_MCP_URL } from "./config.js";
 
+/**
+ * The path of the endpoint we ship. It is a constant of ours, so a message may
+ * print it; see endpointForMessage(). Any other path came from CRISPY_MCP_URL.
+ */
+const DEFAULT_ENDPOINT_PATH = new URL(DEFAULT_CRISPY_MCP_URL).pathname;
+
+/**
+ * The request's patience, and the same number twice: it bounds the wait for the
+ * response headers, and then it bounds the GAP between the body's chunks. A
+ * body that keeps arriving is never cut off however large it is; a body that
+ * stops arriving fails closed. See readBounded().
+ */
 export const DEFAULT_TIMEOUT_MS = 120_000;
 
-export type UpstreamErrorKind = "auth" | "http" | "network" | "protocol";
+/** Teardown happens on the way out, so it gets a far shorter leash. */
+export const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
+
+/**
+ * Upper bound on reading a failed response's body for a diagnostic. By the
+ * time that read happens the request timeout has been cleared -- it was
+ * cleared the moment the headers arrived -- so nothing else bounds it.
+ */
+export const DEFAULT_BODY_READ_TIMEOUT_MS = 2_000;
+
+/**
+ * The absolute ceilings on a body read, and they are a different job from
+ * DEFAULT_TIMEOUT_MS.
+ *
+ * The gap bound rearms on every chunk, which is right for detecting a stall and
+ * useless against a wedge: a server dripping one byte inside every gap window
+ * keeps send() pending for as long as it likes while the body piles up in
+ * memory. Neither of these rearms. Exceeding either fails closed.
+ *
+ * Ten minutes and 64 MiB are chosen to be unreachable by anything Crispy
+ * legitimately sends. A tool result is JSON headed for a model's context
+ * window, so it is kilobytes; the largest plausible one -- a full export --
+ * is single-digit megabytes, and arrives in seconds. Both ceilings leave
+ * three orders of magnitude of headroom over that, and both are far enough
+ * above the 120-second gap bound that a healthy slow response hits neither.
+ */
+export const DEFAULT_MAX_BODY_MS = 600_000;
+
+export const DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+export type UpstreamErrorKind =
+  | "auth"
+  | "http"
+  | "network"
+  | "protocol"
+  | "session"
+  | "shutdown";
 
 export class UpstreamError extends Error {
   readonly kind: UpstreamErrorKind;
@@ -28,32 +76,482 @@ export interface UpstreamOptions {
   apiKey: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  teardownTimeoutMs?: number;
+  bodyReadTimeoutMs?: number;
+  maxBodyMs?: number;
+  maxBodyBytes?: number;
+  /**
+   * Lets a message quote the body of a failed response. Off unless the
+   * operator set CRISPY_MCP_UNSAFE_ERROR_DETAIL=1; see config.ts and the
+   * README. Off is the invariant below; on is an operator's own risk.
+   */
+  unsafeErrorDetail?: boolean;
 }
 
-const MAX_BODY_SNIPPET = 500;
+/**
+ * THE INVARIANT: no upstream-chosen bytes reach a message.
+ *
+ * No string whose CONTENT an upstream picks may appear in an error message, on
+ * stderr, or in a JSON-RPC error -- not the response body, not one field lifted
+ * out of it, not the reason phrase. A message is CONSTRUCTED out of four
+ * trusted parts and nothing else:
+ *
+ *   - the numeric HTTP status, which is a number we read rather than text
+ *     somebody composed;
+ *   - the byte length of the body;
+ *   - our own fixed wording;
+ *   - the endpoint, already reduced by endpointForMessage().
+ *
+ * So `Crispy returned HTTP 500: <54 bytes, not shown>` and no more than that.
+ *
+ * Five rounds tried to make the opposite approach work and each one shipped the
+ * next encoding's bug. Round 4 subtracted the key out of the body; round 5
+ * subtracted it out of the decoded body; round 6 fixed the order of cutting and
+ * scrubbing; round 7 gave up on subtraction and admitted one JSON field by a
+ * character class -- plain printable ascii, no `%`, no 16-character run of the
+ * key. Base64, hex and `&#65;` are all plain printable ascii, and `&#65;` splits
+ * a run into 15-character pieces. A character class is a blacklist wearing
+ * different clothes: ANY string an upstream chooses can encode a credential in
+ * SOME printable form, and that set cannot be enumerated. Stop trying.
+ *
+ * This is closed because the code path does not exist, not because a filter is
+ * clever. There is nothing left here to out-encode.
+ *
+ * SUBTRACTION SURVIVES IN EXACTLY ONE PLACE. strip() below is still used on
+ * strings WE originate: the platform's own wording, which quotes our url back
+ * at us ("Failed to parse URL from <the raw url>"), and the url itself. We know
+ * what is in those, so removing a secret from them leaves something meaningful,
+ * and the writer of the text is not the attacker. Nothing else may use it --
+ * with one advertised exception, the CRISPY_MCP_UNSAFE_ERROR_DETAIL escape
+ * hatch, where it runs as declared best effort and the README says so.
+ */
+
+/** What a message is allowed to show of a string we originate. */
+const MAX_PLATFORM_REASON = 500;
+
+/**
+ * What CRISPY_MCP_UNSAFE_ERROR_DETAIL=1 is allowed to show of a body. The cap
+ * is not a safety property -- nothing about that path is -- it just keeps a
+ * megabyte of html out of a client's error field.
+ */
+const MAX_UNSAFE_DETAIL = 1_000;
+
+/** How much of a failed response's body is read at all, to count and to quote. */
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+
+const REDACTED = "[redacted]";
+
+/** A half-open range of the original text that must not survive into a message. */
+interface Span {
+  start: number;
+  end: number;
+}
+
+const ESCAPE = /^%[0-9A-Fa-f]{2}/;
+
+const UTF8 = new TextDecoder("utf-8", { fatal: false });
+
+const BYTES = new TextEncoder();
+
+/**
+ * Percent-decodes `text` and records, for every code unit of the result, the
+ * span of the original it came from.
+ *
+ * Enumerating encodings is a losing game. The list this replaces held the
+ * literal key, encodeURIComponent, encodeURI and an all-lowercase escape form,
+ * and still missed application/x-www-form-urlencoded -- where a space is `+` --
+ * and any mixture of escape cases, `%2b` beside `%2F`. Adding two more forms
+ * would only move the gap. Decoding the text instead covers every encoding that
+ * decodes, including the ones nobody thought to list.
+ *
+ * `plusAsSpace` is the one thing decoding cannot settle on its own: in a
+ * form-encoded string `+` is a space, in an encodeURI'd one it is a plus, and a
+ * body carries no hint which. The caller matches under both readings.
+ *
+ * One pass, not a fixed point: a doubly-encoded credential (`%2573`) is not
+ * covered. That used to be a hole because upstream bodies came through here;
+ * they do not any more, and nothing we originate encodes itself twice.
+ *
+ * The span map is what makes any of this usable. A match is found in decoded
+ * coordinates and has to be removed from the original, and the two do not line
+ * up: `%2B` is three characters standing in for one.
+ */
+function decodeWithSpans(
+  text: string,
+  plusAsSpace: boolean,
+): { decoded: string; spans: Span[] } {
+  let decoded = "";
+  const spans: Span[] = [];
+
+  for (let i = 0; i < text.length; ) {
+    if (!ESCAPE.test(text.slice(i, i + 3))) {
+      decoded += plusAsSpace && text[i] === "+" ? " " : text[i];
+      spans.push({ start: i, end: i + 1 });
+      i += 1;
+      continue;
+    }
+
+    // A non-ascii character arrives as several escapes in a row and only the
+    // decoder knows how many, so feed it one byte at a time and attribute what
+    // it emits to exactly the escapes consumed since it last emitted anything.
+    //
+    // Pointing every character of the run at the whole run instead fails
+    // closed -- a match anywhere takes all of it -- but it destroys the text
+    // around the match: matching `e` in `%61%62%C3%A9%63%64` redacted the
+    // encoded `abecd` entire. Losing the diagnostic to protect the part of it
+    // that was never at risk is still a loss.
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    let pending = i;
+
+    const attribute = (out: string): void => {
+      if (out === "") {
+        return;
+      }
+      // One span per code unit, not per code point: a match is found with
+      // indexOf, whose indices are code units, and an emoji is two of them.
+      for (let unit = 0; unit < out.length; unit += 1) {
+        spans.push({ start: pending, end: i });
+      }
+      decoded += out;
+      pending = i;
+    };
+
+    while (ESCAPE.test(text.slice(i, i + 3))) {
+      const byte = Number.parseInt(text.slice(i + 1, i + 3), 16);
+      i += 3;
+      attribute(decoder.decode(new Uint8Array([byte]), { stream: true }));
+    }
+    // An incomplete sequence at the end of the run flushes as U+FFFD.
+    attribute(decoder.decode());
+  }
+
+  return { decoded, spans };
+}
+
+/**
+ * Every index at which `needle` occurs in `haystack`, overlaps included.
+ *
+ * Advancing by the needle's length instead skipped every occurrence that began
+ * inside the one before it, so a self-overlapping key left its tail behind:
+ * 127 `A`s against a 64-`A` key redacted the first 64 and printed 63. Spans are
+ * merged afterwards, so overlapping hits cost nothing.
+ */
+function occurrences(haystack: string, needle: string): number[] {
+  const found: number[] = [];
+  for (
+    let at = haystack.indexOf(needle);
+    at !== -1;
+    at = haystack.indexOf(needle, at + 1)
+  ) {
+    found.push(at);
+  }
+  return found;
+}
+
+/** Merges overlapping and touching spans, then replaces each with REDACTED. */
+function redactSpans(text: string, spans: Span[]): string {
+  if (spans.length === 0) {
+    return text;
+  }
+
+  const merged: Span[] = [];
+  for (const span of [...spans].sort((a, b) => a.start - b.start)) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && span.start <= last.end) {
+      last.end = Math.max(last.end, span.end);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+
+  let out = "";
+  let cursor = 0;
+  for (const span of merged) {
+    out += text.slice(cursor, span.start) + REDACTED;
+    cursor = span.end;
+  }
+  return out + text.slice(cursor);
+}
+
+/** Dedupes and drops the empty string. Order is irrelevant: spans are merged. */
+function secretsOf(...secrets: string[]): readonly string[] {
+  return [...new Set(secrets.filter((secret) => secret !== ""))];
+}
+
+/**
+ * Replaces every secret with REDACTED, matching the text as it arrived *and*
+ * both readings of its decoded form. All three passes are needed: the decoded
+ * forms catch a credential that was encoded on the way in, and the raw pass
+ * catches a secret that itself contains a `%` or a `+`, which decoding rewrites.
+ *
+ * Nothing is cut before this runs. Cutting first is what round 6 found -- a
+ * credential straddling the cut lost its tail, and half a credential matches
+ * nothing a whole-key search looks for -- and cutting at a bound far past the
+ * snippet was no better, because redaction COMPRESSES: 1023 adjacent keys merge
+ * into one `[redacted]` and pull the 64-KiB mark back inside the snippet. The
+ * only safe order is scrub everything, then cut.
+ */
+function strip(text: string, secrets: readonly string[]): string {
+  if (secrets.length === 0 || text === "") {
+    return text;
+  }
+
+  const readings = [
+    decodeWithSpans(text, true),
+    decodeWithSpans(text, false),
+  ];
+  const hits: Span[] = [];
+
+  for (const secret of secrets) {
+    for (const at of occurrences(text, secret)) {
+      hits.push({ start: at, end: at + secret.length });
+    }
+    for (const { decoded, spans } of readings) {
+      for (const at of occurrences(decoded, secret)) {
+        hits.push({
+          start: spans[at].start,
+          end: spans[at + secret.length - 1].end,
+        });
+      }
+    }
+  }
+
+  return redactSpans(text, hits);
+}
+
+/** Joins what was retained of a body. */
+function concatenate(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out;
+}
+
+/** Which bound ended a read before the body did. */
+type BodyLimit = "gap" | "duration" | "bytes";
+
+/** What a bounded read of a response body came back with. */
+interface BodyRead {
+  /** What was retained, decoded. Not necessarily the whole body. */
+  text: string;
+  /** Byte length of everything that arrived, retained or not. */
+  bytes: number;
+  /** False if the read hit a bound or its retention cap. */
+  complete: boolean;
+  /**
+   * The bound that ended the read, if one did. Undefined when the body simply
+   * finished -- including when it finished but was retained only in part, which
+   * is what the error path does on purpose.
+   */
+  limit?: BodyLimit;
+}
 
 export class UpstreamClient {
   private readonly url: string;
   private readonly apiKey: string;
+
+  /**
+   * The endpoint as it is allowed to appear in a message: origin and path,
+   * nothing else. CRISPY_MCP_URL is user-supplied and unrestricted, so a
+   * credential may well be sitting in a query component or in userinfo -- and
+   * these messages go to stderr *and* back to the client as a JSON-RPC error.
+   * Nothing may interpolate `url`; interpolate this.
+   */
+  private readonly safeUrl: string;
+
+  /** The api key alone. Sanitises the url itself; see endpointForMessage(). */
+  private readonly keySecrets: readonly string[];
+
+  /** Everything that may not appear in a message. */
+  private readonly secrets: readonly string[];
+
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly teardownTimeoutMs: number;
+  private readonly bodyReadTimeoutMs: number;
+  private readonly maxBodyMs: number;
+  private readonly maxBodyBytes: number;
+  private readonly unsafeErrorDetail: boolean;
 
   private sessionId: string | undefined;
   private protocolVersion: string | undefined;
 
+  /**
+   * Bumped every time the session is invalidated or replaced. The bridge
+   * dispatches messages concurrently, so several requests are normally in
+   * flight at once: each one snapshots this counter on its way out, and a
+   * response whose snapshot has since moved on belongs to a session that no
+   * longer exists. It must not write anything back into this client -- neither
+   * to resurrect a dead id nor to clear the live one that replaced it.
+   */
+  private sessionGeneration = 0;
+
+  /** Set the moment teardown starts. From then on nothing is forwarded. */
+  private stopped = false;
+
   constructor(options: UpstreamOptions) {
     this.url = options.url;
     this.apiKey = options.apiKey;
+    this.keySecrets = secretsOf(options.apiKey);
+    this.safeUrl = this.endpointForMessage(options.url);
+    // The raw url is a secret exactly when the safe url is not the raw url.
+    //
+    // undici quotes the raw url back at us -- "Failed to parse URL from <the
+    // raw url>" -- so anything endpointForMessage() dropped would walk back in
+    // through the platform's own wording. Deriving that from the reduction
+    // itself, rather than from a second predicate listing the parts that can
+    // carry a credential, is what closes the gap: the old predicate knew about
+    // userinfo, query and fragment and did not know a path segment can be a
+    // credential too. A url that is already its own safe form is not a secret,
+    // so a message that legitimately names it is not flattened.
+    this.secrets = secretsOf(
+      ...(this.safeUrl === options.url ? [] : [options.url]),
+      options.apiKey,
+    );
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.teardownTimeoutMs =
+      options.teardownTimeoutMs ?? DEFAULT_TEARDOWN_TIMEOUT_MS;
+    this.bodyReadTimeoutMs =
+      options.bodyReadTimeoutMs ?? DEFAULT_BODY_READ_TIMEOUT_MS;
+    this.maxBodyMs = options.maxBodyMs ?? DEFAULT_MAX_BODY_MS;
+    this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+    this.unsafeErrorDetail = options.unsafeErrorDetail ?? false;
   }
 
-  /** Strips the api key out of anything on its way to a log or an error. */
-  private redact(text: string): string {
-    if (this.apiKey === "") {
-      return text;
+  /**
+   * The sink for a string the PLATFORM worded for us, and the only one left.
+   *
+   * Sanitising the url where *we* interpolate it is not enough, because we are
+   * not the only one who can put it in a message: undici rejects an unparseable
+   * url with "Failed to parse URL from <the raw url>", query and all, and that
+   * wording becomes the failure reason we go on to quote. bridge.ts copies
+   * whatever comes out of here to stderr and into the JSON-RPC error, and
+   * bridge.ts holds neither the key nor the url, so it cannot sanitise a thing.
+   *
+   * Scrub the whole string, then cut. Never the other way round: a credential
+   * straddling the cut loses its tail, and half a credential matches nothing a
+   * whole-key search looks for. There is no pre-cut here at all now -- the only
+   * strings that reach this are ours, bounded by the url we were configured
+   * with, so there is nothing to bound that scrubbing them would not already.
+   *
+   * This runs on the untrusted fragment, never on the assembled message:
+   * safeUrl is the sanitised url and is allowed to stay.
+   */
+  private platformReason(text: string): string {
+    const scrubbed = strip(text, this.secrets);
+    return scrubbed.length > MAX_PLATFORM_REASON
+      ? `${scrubbed.slice(0, MAX_PLATFORM_REASON)}...`
+      : scrubbed;
+  }
+
+  /**
+   * All an upstream body contributes to a message: how many bytes of it there
+   * were. Not a word of its content -- see THE INVARIANT at the top of this
+   * file. The size is ours: we counted it, the upstream did not compose it.
+   *
+   * A size is a weak diagnostic and that is the point of the escape hatch
+   * below, not a reason to soften this. Whether a particular string is safe to
+   * quote is exactly the question five rounds of filters got wrong, so this
+   * one does not ask it.
+   */
+  private bodyDetail(read: BodyRead): string {
+    if (read.bytes === 0) {
+      return "";
     }
-    return text.split(this.apiKey).join("[redacted]");
+
+    const unshown = `<${read.bytes} bytes, not shown>`;
+    if (!this.unsafeErrorDetail) {
+      return unshown;
+    }
+
+    // Past this line is the CRISPY_MCP_UNSAFE_ERROR_DETAIL=1 path, and the
+    // invariant above does not hold on it. That is what the operator asked
+    // for. strip() runs as BEST EFFORT and nothing more: it catches an upstream
+    // that reflects the key back verbatim, and it is defeated by any of the
+    // encodings in this file's history. The README says so in those words.
+    if (!read.complete || read.text.trim() === "") {
+      return unshown;
+    }
+
+    const scrubbed = strip(read.text.trim(), this.secrets);
+    return scrubbed.length > MAX_UNSAFE_DETAIL
+      ? `${scrubbed.slice(0, MAX_UNSAFE_DETAIL)}...`
+      : scrubbed;
+  }
+
+  /**
+   * `HTTP <code>`, and never anything else.
+   *
+   * The reason phrase used to ride along behind a character class. It crossed
+   * the wire and an upstream picks it, so it is the same class as the body, and
+   * R6 showed that is not theoretical: a 15-character half in the phrase and a
+   * 15-character half in the body reassembled a 30-character key across the
+   * `: ` between them, with neither half long enough to trip a 16-character
+   * window. Both halves lost their ride at once when this stopped reading
+   * statusText at all.
+   *
+   * The code stays because a misrouted endpoint is undiagnosable without it,
+   * and because a number we read is not text somebody composed.
+   */
+  private statusLine(response: Response): string {
+    return `HTTP ${response.status}`;
+  }
+
+  /**
+   * The endpoint as a message is allowed to name it: the origin, plus at most
+   * the SHAPE of the path.
+   *
+   * The rule, in full:
+   *   - userinfo, query and fragment: never.
+   *   - the path: printed only when it is the default endpoint's path, which
+   *     is a constant of ours and therefore carries nothing. Any other path is
+   *     reduced to its segment count.
+   *   - a url that will not parse: not printed at all. Name the setting.
+   *
+   * CRISPY_MCP_URL is user-supplied and unrestricted, and a path segment can be
+   * a credential as easily as a query component can:
+   * `https://crispy.test/token/hunter2/api/mcp` put `hunter2` into a diagnostic
+   * that goes to stderr AND back to the client as a JSON-RPC error. Matching
+   * the api key as a string is no defence -- a path credential need not be the
+   * api key at all -- so no arbitrary path segment is printed, ever.
+   *
+   * Parsing is defensive on purpose. This runs on the error path, so a url the
+   * URL parser rejects must produce a worse message, never a thrown one. Worse
+   * means less: a url that will not parse is the one this function can strip
+   * nothing out of, so echoing it prints back whatever credential it carries.
+   * Naming the setting is enough to find the problem, since the default url
+   * always parses -- an unparseable one can only have come from CRISPY_MCP_URL.
+   */
+  private endpointForMessage(url: string): string {
+    const unnameable =
+      "the configured endpoint (CRISPY_MCP_URL is not a valid url)";
+
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return unnameable;
+    }
+
+    // A scheme with no origin of its own identifies nothing, and "null" would
+    // read as a hostname called null.
+    if (parsed.origin === "null" || parsed.origin === "") {
+      return unnameable;
+    }
+
+    const segments = parsed.pathname.split("/").filter((part) => part !== "");
+    const shape =
+      segments.length === 0
+        ? ""
+        : parsed.pathname === DEFAULT_ENDPOINT_PATH
+          ? parsed.pathname
+          : `/<${segments.length} path segment${segments.length === 1 ? "" : "s"}>`;
+
+    return strip(`${parsed.origin}${shape}`, this.keySecrets);
   }
 
   private headers(): Record<string, string> {
@@ -73,7 +571,45 @@ export class UpstreamClient {
     return headers;
   }
 
+  /**
+   * The only exit from this client, and the last place anything can be
+   * sanitised. bridge.ts copies whatever comes out of here to stderr and into
+   * the JSON-RPC error it hands the client, and bridge.ts holds neither the key
+   * nor the url, so it cannot sanitise a thing. dispatch() has unwrapped awaits
+   * in it -- `response.text()` on the happy path rejects with a platform error
+   * worded by the platform -- and a stray error escaping raw is a leak. An
+   * UpstreamError has already been through the sink; anything else has not.
+   */
   async send(message: unknown): Promise<unknown | null> {
+    try {
+      return await this.dispatch(message);
+    } catch (error) {
+      if (error instanceof UpstreamError) {
+        throw error;
+      }
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new UpstreamError(
+        `The exchange with Crispy at ${this.safeUrl} failed: ${this.platformReason(reason)}`,
+        "network",
+      );
+    }
+  }
+
+  private async dispatch(message: unknown): Promise<unknown | null> {
+    // Teardown drops the session id and then awaits the DELETE. The local
+    // transport is still accepting messages while that is in flight, and a
+    // buffered initialize forwarded here would open a new session that
+    // nothing ever deletes. Fail closed instead.
+    if (this.stopped) {
+      throw new UpstreamError(
+        "crispy-mcp is shutting down: the Crispy session is closed, so this request was not sent.",
+        "shutdown",
+      );
+    }
+
+    const sentSessionId = this.sessionId;
+    // Advances only if this very request is the one that moves the session on.
+    let generation = this.sessionGeneration;
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort(new Error("timeout"));
@@ -90,31 +626,80 @@ export class UpstreamClient {
     } catch (error) {
       if (controller.signal.aborted) {
         throw new UpstreamError(
-          `Crispy did not respond within ${this.timeoutMs}ms: the request to ${this.url} timed out.`,
+          `Crispy did not respond within ${this.timeoutMs}ms: the request to ${this.safeUrl} timed out.`,
           "network",
         );
       }
       const reason = error instanceof Error ? error.message : String(error);
       throw new UpstreamError(
-        `Could not reach Crispy at ${this.url}: ${this.redact(reason)}`,
+        `Could not reach Crispy at ${this.safeUrl}: ${this.platformReason(reason)}`,
         "network",
       );
     } finally {
       clearTimeout(timer);
     }
 
-    const sessionId = response.headers.get("mcp-session-id");
-    if (sessionId !== null && sessionId !== "") {
-      this.sessionId = sessionId;
+    // A session exists only if the server accepted the request that created
+    // it. Adopting before this check let a 500 install an id that no handshake
+    // stands behind, and let a 404 install one and invalidate it in the same
+    // breath while the caller was told its session had merely expired.
+    if (!response.ok) {
+      throw await this.httpError(response, sentSessionId, generation);
     }
 
-    if (!response.ok) {
-      throw await this.httpError(response);
+    const sessionId = response.headers.get("mcp-session-id");
+    if (
+      sessionId !== null &&
+      sessionId !== "" &&
+      // Teardown bumps the generation unconditionally -- see endSession -- and
+      // the counter only ever climbs, so no request that left before the signal
+      // can still match it. That makes this one check the whole fence: a
+      // `!this.stopped` term beside it could not fail on its own and no test
+      // could hold it honest.
+      generation === this.sessionGeneration
+    ) {
+      generation = this.adoptSession(sessionId);
     }
 
     const body = await this.readBody(response);
-    this.rememberProtocolVersion(body);
+    if (generation === this.sessionGeneration) {
+      this.rememberProtocolVersion(body);
+    }
     return body;
+  }
+
+  /**
+   * Records the id the upstream assigned and returns the generation the caller
+   * is now in. Adopting an id -- any id, including the first -- moves the
+   * session on, so everything still in flight under the old state is fenced
+   * off. Bumping only when the id *changed* left the opening case unfenced:
+   * two requests that both leave before any session exists snapshot the same
+   * generation, and the second would sail through the guard and replace what
+   * the first had just adopted.
+   */
+  private adoptSession(sessionId: string): number {
+    if (this.sessionId === sessionId) {
+      return this.sessionGeneration;
+    }
+
+    // A replacement is a new session, and the protocol version was negotiated
+    // with the old one. rememberProtocolVersion only writes into an empty
+    // slot, so leaving it behind would pin the new session to the old
+    // session's version on every later request.
+    if (this.sessionId !== undefined) {
+      this.protocolVersion = undefined;
+    }
+
+    this.sessionId = sessionId;
+    this.sessionGeneration += 1;
+    return this.sessionGeneration;
+  }
+
+  /** Drops the session and fences every request still in flight under it. */
+  private invalidateSession(): void {
+    this.sessionId = undefined;
+    this.protocolVersion = undefined;
+    this.sessionGeneration += 1;
   }
 
   /**
@@ -131,8 +716,45 @@ export class UpstreamClient {
     }
   }
 
-  private async httpError(response: Response): Promise<UpstreamError> {
-    const body = this.redact((await this.safeText(response)).trim());
+  private async httpError(
+    response: Response,
+    sentSessionId: string | undefined,
+    generation: number,
+  ): Promise<UpstreamError> {
+    // The spec lets the server drop a session whenever it likes and answer
+    // anything still carrying that id with a 404. Retrying is not ours to do:
+    // only the client can re-run initialize, so drop the dead state and say so.
+    //
+    // The status and the id we sent are both known the moment the headers
+    // arrive, and that is when this has to be decided. Reading the body first
+    // meant a 404 whose body stream never closed left the dead session
+    // installed for good -- the request timeout was cleared as soon as the
+    // headers landed, so nothing was going to interrupt that read, and every
+    // later request kept sending an id the server had already dropped. A body
+    // is a diagnostic detail; it must never gate a state transition.
+    const expired = response.status === 404 && sentSessionId !== undefined;
+    if (expired && generation === this.sessionGeneration) {
+      this.invalidateSession();
+    }
+
+    const body = this.bodyDetail(await this.safeRead(response));
+    const status = this.statusLine(response);
+
+    if (expired) {
+      // A wrong CRISPY_MCP_URL, a bad deploy and a genuinely dropped session
+      // all look like this. The advice is right for the common case, but the
+      // status has to survive or a misrouted endpoint is undiagnosable.
+      return new UpstreamError(
+        [
+          `The Crispy session expired: ${status} -- the server no longer recognises this session id.`,
+          "Reconnect your MCP client so it runs initialize again.",
+          body === "" ? "" : `Upstream said: ${body}`,
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+        "session",
+      );
+    }
 
     if (response.status === 401 || response.status === 403) {
       return new UpstreamError(
@@ -148,20 +770,174 @@ export class UpstreamClient {
     }
 
     return new UpstreamError(
-      `Crispy returned HTTP ${response.status} ${response.statusText}`.trim() +
-        (body === "" ? "" : `: ${body}`),
+      `Crispy returned ${status}${body === "" ? "" : `: ${body}`}`,
       "http",
     );
   }
 
-  private async safeText(response: Response): Promise<string> {
+  /**
+   * Tells Crispy the session is finished, per the Streamable HTTP spec's
+   * DELETE. Best effort by design: shutdown must not be blocked by a server
+   * that is slow, unreachable, or answers 405 because it has no teardown.
+   */
+  async endSession(): Promise<void> {
+    // Teardown fences what is already in flight as well as what comes after
+    // it. `stopped` turns away new sends; the unconditional generation bump
+    // below fences every response that snapshotted the live generation on its
+    // way out, including one that is past the `stopped` check already. Both
+    // jobs are needed, and the bump has to happen even when there is no cached
+    // id -- returning early without it used to let an initialize that left
+    // before the signal come back afterwards and quietly become live state.
+    //
+    // Such a late id is abandoned, not DELETEd. Deleting it would mean opening
+    // a fresh bounded request after the shutdown handshake has already spent
+    // its deadline -- the process may be gone before it lands, and the caller
+    // would be waiting on a second teardown it never asked for. Abandoning is
+    // safe because the id never enters this client: nothing can send under it,
+    // and the server reaps an untouched session on its own idle timeout.
+    this.stopped = true;
+
+    const sessionId = this.sessionId;
+    const headers = this.headers();
+    this.invalidateSession();
+
+    if (sessionId === undefined) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(new Error("timeout"));
+    }, this.teardownTimeoutMs);
+
     try {
-      const text = await response.text();
-      return text.length > MAX_BODY_SNIPPET
-        ? `${text.slice(0, MAX_BODY_SNIPPET)}...`
-        : text;
+      await this.fetchImpl(this.url, {
+        method: "DELETE",
+        headers,
+        signal: controller.signal,
+      });
     } catch {
-      return "";
+      // Nothing to do and nobody to tell: the process is on its way out.
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Reads a response body under a bound of its own, owning the stream reader.
+   *
+   * Owning the reader is the point. `response.text()` locks the body, so the
+   * `response.body.cancel()` that used to run at the deadline rejected on a
+   * locked stream, the rejection was swallowed, and the original read carried
+   * on holding the socket. Cancelling through a reader we hold actually
+   * cancels: the pending read resolves done and the stream is released.
+   *
+   * `perChunk` chooses what the deadline measures. On the happy path it is the
+   * GAP between chunks, because a total bound generous enough for a large slow
+   * tool result would be far too generous to bound a wedge, while a gap bound
+   * is both: a response that keeps arriving is never cut off, and one that
+   * stops arriving is. On the error path it is the whole read, because that
+   * body is a diagnostic nicety and no caller waiting for an answer should pay
+   * more than a moment for one.
+   *
+   * Two ABSOLUTE ceilings sit alongside it and neither of them rearms. The gap
+   * bound is a stall detector, and a stall is not the only way to wedge a
+   * read: a server dripping one byte inside every gap window rearms the bound
+   * for ever, so send() stays pending and the body accumulates in memory with
+   * nothing to stop it. DEFAULT_MAX_BODY_MS bounds the wall clock and
+   * DEFAULT_MAX_BODY_BYTES bounds the total that arrived, retained or not. Each
+   * fails closed and says which one bit, so a legitimate response that somehow
+   * reaches one is diagnosable rather than mysterious.
+   */
+  private async readBounded(
+    response: Response,
+    bound: { ms: number; perChunk: boolean },
+    retainBytes = Number.POSITIVE_INFINITY,
+  ): Promise<BodyRead> {
+    const stream = response.body;
+    if (stream === null) {
+      // Nothing to read from and nothing to bound: a bodyless response.
+      const text = await response.text();
+      return { text, bytes: BYTES.encode(text).length, complete: true };
+    }
+
+    const reader = stream.getReader();
+    let limit: BodyLimit | undefined;
+    const stop = (which: BodyLimit): void => {
+      limit ??= which;
+      void reader.cancel().catch(() => undefined);
+    };
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (): void => {
+      clearTimeout(timer);
+      timer = setTimeout(() => stop("gap"), bound.ms);
+    };
+    // Armed once and never rearmed. That is the whole difference from arm().
+    const ceiling = setTimeout(() => stop("duration"), this.maxBodyMs);
+
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    let retained = 0;
+
+    arm();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value !== undefined) {
+          bytes += value.byteLength;
+          if (retained < retainBytes) {
+            const room = retainBytes - retained;
+            const kept =
+              value.byteLength <= room ? value : value.subarray(0, room);
+            chunks.push(kept);
+            retained += kept.byteLength;
+          }
+          // Counted against everything that ARRIVED, not against what was
+          // retained: the error path retains 64 KiB, and a ceiling on that
+          // would bound nothing a flood has to get past.
+          if (bytes > this.maxBodyBytes) {
+            stop("bytes");
+            break;
+          }
+          if (bound.perChunk) {
+            arm();
+          }
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(ceiling);
+    }
+
+    return {
+      text: UTF8.decode(concatenate(chunks, retained)),
+      bytes,
+      complete: limit === undefined && retained === bytes,
+      limit,
+    };
+  }
+
+  /**
+   * A failed response's body, for a diagnostic and nothing else. Bounded in its
+   * own right: the request timeout was cleared the moment the headers arrived,
+   * so a body stream that never closes would hang this read for ever. A missing
+   * detail makes a worse message; a read that never returns makes no message at
+   * all. Retention is bounded too -- past MAX_DIAGNOSTIC_BYTES there is no
+   * error field worth finding, and the message falls back to the byte count.
+   */
+  private async safeRead(response: Response): Promise<BodyRead> {
+    try {
+      return await this.readBounded(
+        response,
+        { ms: this.bodyReadTimeoutMs, perChunk: false },
+        MAX_DIAGNOSTIC_BYTES,
+      );
+    } catch {
+      return { text: "", bytes: 0, complete: false };
     }
   }
 
@@ -171,7 +947,27 @@ export class UpstreamClient {
     }
 
     const contentType = response.headers.get("content-type") ?? "";
-    const text = await response.text();
+    // Unwrapped on purpose: a torn body rejects here with a platform error, and
+    // send() is what makes sure nothing leaves this client unsanitised.
+    const read = await this.readBounded(response, {
+      ms: this.timeoutMs,
+      perChunk: true,
+    });
+
+    // A 2xx whose body hangs used to never settle: this read had no deadline of
+    // its own and the request timer was cleared when the headers arrived. That
+    // is the wedge an expired session used to cause, reached through a
+    // different door, and shipping a wedge inside the fix for a wedge is not
+    // acceptable.
+    //
+    // Each bound gets its own wording, because "the body went quiet" is a wrong
+    // and misleading thing to tell somebody whose server was in fact sending
+    // busily the whole time. Not one of these quotes a byte of the body.
+    if (!read.complete) {
+      throw new UpstreamError(this.abandonedBodyMessage(read), "network");
+    }
+
+    const text = read.text;
 
     if (text.trim() === "") {
       return null;
@@ -191,12 +987,24 @@ export class UpstreamClient {
     try {
       return JSON.parse(text) as unknown;
     } catch {
+      // Constructed, not scrubbed: this is an upstream body, so nothing of it
+      // enters the message but its size. See bodyDetail().
       throw new UpstreamError(
-        `Crispy returned a response that is not JSON: ${this.redact(
-          text.slice(0, MAX_BODY_SNIPPET),
-        )}`,
+        `Crispy returned a response that is not JSON: ${this.bodyDetail(read)}`,
         "protocol",
       );
+    }
+  }
+
+  /** Why a body read was abandoned. Built from the bound, never from the body. */
+  private abandonedBodyMessage(read: BodyRead): string {
+    switch (read.limit) {
+      case "duration":
+        return `Crispy's response did not finish within ${this.maxBodyMs}ms: the body from ${this.safeUrl} was still arriving at the absolute limit, so the read was abandoned.`;
+      case "bytes":
+        return `Crispy's response grew past ${this.maxBodyBytes} bytes: the body from ${this.safeUrl} exceeded the absolute limit, so the read was abandoned.`;
+      default:
+        return `Crispy stopped sending the response: the body from ${this.safeUrl} went quiet for ${this.timeoutMs}ms, so the read was abandoned.`;
     }
   }
 }
