@@ -12,6 +12,11 @@ function readManifest<T>(name: string): T {
   return JSON.parse(readFileSync(path, "utf8")) as T;
 }
 
+function readRepositoryFile(name: string): string {
+  const path = new URL(`../${name}`, import.meta.url);
+  return readFileSync(path, "utf8");
+}
+
 interface PackageJson {
   name: string;
   version: string;
@@ -34,6 +39,18 @@ const server = readManifest<ServerJson>("server.json");
 const npmPackage = server.packages?.find(
   (entry) => entry.registryType === "npm",
 );
+
+const unsupportedLinkedInClaims =
+  /safe sending limits|safe limits built in|sustainable by default|human-like|humanlike/i;
+
+describe("public metadata copy", () => {
+  it.each(["README.md", "package.json", "server.json"])(
+    "does not advertise unsupported LinkedIn safety claims in %s",
+    (name) => {
+      expect(readRepositoryFile(name)).not.toMatch(unsupportedLinkedInClaims);
+    },
+  );
+});
 
 /**
  * The published semver 2.0.0 grammar, verbatim. The hand-rolled `(\d+)` version
