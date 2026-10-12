@@ -41,7 +41,7 @@ const npmPackage = server.packages?.find(
 );
 
 const unsupportedLinkedInClaims =
-  /safe sending limits|safe limits built in|sustainable by default/i;
+  /safe sending limits|safe limits built in|sustainable by default|human-like|humanlike/i;
 
 describe("public metadata copy", () => {
   it.each(["README.md", "package.json", "server.json"])(

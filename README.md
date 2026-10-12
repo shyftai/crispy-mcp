@@ -27,7 +27,7 @@ One API key gives any AI agent the full LinkedIn surface:
 
 - **Find leads** — search people and companies, run saved searches, enrich profiles.
 - **Message** — send connection requests, direct messages, and InMail; triage and reply in your inbox.
-- **Run campaigns** — multi-step outreach sequences with human-like pacing.
+- **Run campaigns** — multi-step outreach sequences with paced sending.
 - **Manage content** — draft, schedule, and analyze posts; track engagement.
 
 Every account gets activity limits, plus optional warm-up when enabled.
