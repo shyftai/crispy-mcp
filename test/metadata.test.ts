@@ -31,6 +31,14 @@ interface ServerJson {
     identifier: string;
     version: string;
   }>;
+  remotes?: Array<{
+    type: string;
+    url: string;
+    headers?: Array<{
+      name: string;
+      isRequired?: boolean;
+    }>;
+  }>;
 }
 
 const pkg = readManifest<PackageJson>("package.json");
@@ -38,6 +46,10 @@ const server = readManifest<ServerJson>("server.json");
 
 const npmPackage = server.packages?.find(
   (entry) => entry.registryType === "npm",
+);
+
+const streamableHttpRemote = server.remotes?.find(
+  (entry) => entry.type === "streamable-http",
 );
 
 const unsupportedLinkedInClaims =
@@ -108,6 +120,17 @@ describe("registry manifests", () => {
       server.version,
       "server.json version is the registry record version: bump it with package.json version",
     ).toBe(pkg.version);
+  });
+
+  it("lets registry clients discover OAuth without a required Authorization header", () => {
+    expect(
+      streamableHttpRemote,
+      "server.json has no streamable-http remote",
+    ).toBeDefined();
+    expect(
+      streamableHttpRemote?.headers,
+      "the streamable-http remote must omit headers so registry clients can discover OAuth",
+    ).toBeUndefined();
   });
 
   // npm versions are immutable. 1.0.0 shipped on 2026-09-17 without `mcpName`,

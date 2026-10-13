@@ -36,15 +36,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://crispy.sh/api/mcp",
-      "headers": [
-        {
-          "name": "Authorization",
-          "description": "Bearer token: your Crispy API key from the dashboard",
-          "isRequired": true,
-          "isSecret": true
-        }
-      ]
+      "url": "https://crispy.sh/api/mcp"
     }
   ]
 }

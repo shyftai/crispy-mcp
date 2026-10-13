@@ -4,7 +4,7 @@
 
 - **Website:** https://crispy.sh
 - **MCP endpoint:** `https://crispy.sh/api/mcp` (Streamable HTTP)
-- **Auth:** `Authorization: Bearer <your API key>`
+- **Auth:** The remote endpoint supports OAuth directly. Clients that send `Authorization` can use `Bearer <your API key>`.
 - **Local bridge:** `npx crispy-mcp` (stdio, for clients that cannot send headers)
 - **Docs & per-client setup:** https://crispy.sh/integrations
 
