@@ -61,13 +61,14 @@ Report what the profile says. Do not fill gaps with guesses.
 Draft the note first. Show the draft. Wait for the user to say yes. Send only
 after they approve it, and send one at a time.
 
-Crispy paces outbound sending. Do not try to work around the pacing.
+Every account has activity limits, plus optional warm-up when enabled, and a
+campaign paces its own sending. Do not try to work around any of it.
 
 ### Run campaigns
 
 A campaign is a multi-step outreach sequence with paced sending. Show the user
 the steps and the audience before you start one. Get approval for the whole
-sequence, then run it. Stop the campaign as soon as the user asks.
+sequence, then run it. If the user asks to stop, do not continue the sequence.
 
 ### Handle replies and posts
 
@@ -76,14 +77,23 @@ schedule and analyse posts the same way. Show the draft before it goes out.
 
 ## Safety rules
 
+These rules are instructions for the calling agent. This server does not
+enforce them. The stdio bridge forwards every call verbatim, so a call that
+breaks one of them still goes out.
+
 - Stay inside the activity limits your account shows. Stop when you reach one,
-  and tell the user which one you hit.
+  and tell the user which one you hit. When a call is rejected and the bridge
+  hides the body, tell the user the call was rate limited and that the detail
+  is suppressed by configuration.
 - Never mass-send. No bulk connection requests and no bulk messages. Ask for
   approval for each batch, and name the count and the audience when you ask.
+  Approval covers the batch. Sending is still one at a time.
 - Draft first for anything that leaves the account.
 - Keep the API key out of logs, files, messages and answers.
-- Do not change the endpoint or the auth scheme. Both are fixed by the config in
-  this repository.
+- Do not change the endpoint or the auth scheme in normal use. The remote
+  endpoint also supports OAuth, and `CRISPY_MCP_URL` can point the bridge at
+  another URL, so nothing pins either one down. Change them only if the user
+  asks for it.
 - Leave `CRISPY_MCP_UNSAFE_ERROR_DETAIL` off. With it on, the text of a failed
   response lands in the error the user sees, and that text is not ours. Turn it
   on only if the user asks for it and understands the risk.
