@@ -65,6 +65,34 @@ describe("public metadata copy", () => {
 });
 
 /**
+ * Retired listing literals, checked over the same three files the registry and
+ * mcpservers.org render verbatim. "150+ tools" named a bare count that drifts
+ * from crispy.sh/llms.txt, and "flat per-seat" named neither the documented
+ * scope nor the billing unit on crispy.sh/pricing. The replacement copy links
+ * to the live source instead, so any reappearance of these literals is a
+ * regression rather than a wording choice.
+ */
+const retiredListingLiterals: ReadonlyArray<RegExp> = [
+  /\b\d{2,3}\+\s+(?:LinkedIn\s+)?tools\b/i,
+  /one flat per-seat price/i,
+];
+
+describe("retired listing copy", () => {
+  it.each(["README.md", "package.json", "server.json"])(
+    "does not reintroduce retired listing literals in %s",
+    (name) => {
+      const content = readRepositoryFile(name);
+      for (const literal of retiredListingLiterals) {
+        expect(
+          literal.test(content),
+          `${name} matches retired literal ${literal}`,
+        ).toBe(false);
+      }
+    },
+  );
+});
+
+/**
  * The published semver 2.0.0 grammar, verbatim. The hand-rolled `(\d+)` version
  * of this accepted `01.1.0` and a prerelease of `-01`: both are rejected by
  * semver and neither is a version npm will ever hold, so a test built on that
