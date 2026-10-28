@@ -232,8 +232,8 @@ The bridge forwards `initialize`, `tools/list`, `tools/call` and every other met
 - **Native MCP server, REST API, and CLI** — not a browser extension.
 - **Works with any AI agent** — Claude, Cursor, Codex, VS Code, JetBrains, n8n, and anything that speaks MCP or HTTP.
 - **Activity limits, plus optional warm-up when enabled**.
-- **One flat per-seat price, every tool included** — no add-ons, no per-action metering.
-- **150+ LinkedIn tools from one API key.**
+- **One plan per connected LinkedIn account, every documented tool included.** No add-ons and no per-request fees. Current price: https://crispy.sh/pricing
+- **One API key, one tool registry.** The live tool list and count: https://crispy.sh/llms.txt
 
 ---
 
