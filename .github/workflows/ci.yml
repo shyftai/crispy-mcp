@@ -17,9 +17,10 @@ permissions:
   contents: read
 
 jobs:
+  # Runs on BoxD runners (shyftai/hq scaler). Rollback: revert this commit.
   test:
     name: build + test (node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, boxd]
     timeout-minutes: 10
     strategy:
       fail-fast: false
