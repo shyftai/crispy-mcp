@@ -23,7 +23,7 @@ The bridge is a transparent proxy. It does not define its own tools, so every to
 
 ## What you can do
 
-One API key gives any AI agent the full LinkedIn surface:
+Either path gives any AI agent the full LinkedIn surface:
 
 - **Find leads** — search people and companies, run saved searches, enrich profiles.
 - **Message** — send connection requests, direct messages, and InMail; triage and reply in your inbox.
@@ -37,8 +37,7 @@ Every account gets activity limits, plus optional warm-up when enabled.
 ## Quick start
 
 1. Create an account at https://crispy.sh and connect your LinkedIn.
-2. Generate an API key in the dashboard.
-3. Add Crispy to your MCP client using one of the configs below. Replace `YOUR_API_KEY` with your key.
+2. Connect your MCP client. Clients that support OAuth sign in directly and hold no key. Clients that send an `Authorization` header use a Bearer API key from the dashboard instead. The configs below show the API key path.
 
 ### Claude Code
 
@@ -49,7 +48,7 @@ claude mcp add --transport http crispy https://crispy.sh/api/mcp \
 
 ### Claude Desktop
 
-Claude Desktop connects remote servers through the Connectors settings: add a custom connector pointing at `https://crispy.sh/api/mcp` with the `Authorization: Bearer YOUR_API_KEY` header.
+Claude Desktop connects remote servers through the Connectors settings: add a custom connector pointing at `https://crispy.sh/api/mcp` and sign in with OAuth. A client build that cannot do OAuth can send an `Authorization: Bearer <your API key>` header instead.
 
 If your build cannot set a header, use the stdio bridge instead. `claude_desktop_config.json`:
 
@@ -233,7 +232,7 @@ The bridge forwards `initialize`, `tools/list`, `tools/call` and every other met
 - **Works with any AI agent** — Claude, Cursor, Codex, VS Code, JetBrains, n8n, and anything that speaks MCP or HTTP.
 - **Activity limits, plus optional warm-up when enabled**.
 - **One flat per-seat price, every tool included** — no add-ons, no per-action metering.
-- **150+ LinkedIn tools from one API key.**
+- **150+ LinkedIn tools over one connection, OAuth or an API key.**
 
 ---
 
