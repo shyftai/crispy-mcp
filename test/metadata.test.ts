@@ -56,7 +56,12 @@ const unsupportedLinkedInClaims =
   /safe sending limits|safe limits built in|sustainable by default|human-like|humanlike/i;
 
 describe("public metadata copy", () => {
-  it.each(["README.md", "package.json", "server.json"])(
+  it.each([
+    "README.md",
+    "package.json",
+    "server.json",
+    "skills/crispy-linkedin/SKILL.md",
+  ])(
     "does not advertise unsupported LinkedIn safety claims in %s",
     (name) => {
       expect(readRepositoryFile(name)).not.toMatch(unsupportedLinkedInClaims);
