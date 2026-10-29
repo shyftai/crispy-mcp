@@ -1,0 +1,19 @@
+{
+  "name": "crispy",
+  "displayName": "Crispy",
+  "description": "Hosted LinkedIn MCP server for AI agents on your own account. People search, profiles, invitations, messages and campaigns, under daily caps per action category.",
+  "version": "1.1.0",
+  "author": {
+    "name": "Shyft AI LLC"
+  },
+  "homepage": "https://crispy.sh",
+  "repository": "https://github.com/shyftai/crispy-mcp",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "linkedin",
+    "crispy",
+    "ai-agents"
+  ]
+}
