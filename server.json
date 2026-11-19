@@ -1,8 +1,8 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "sh.crispy/crispy",
-  "description": "Full LinkedIn access for AI agents: leads, messaging, and campaigns with activity limits built in.",
-  "version": "1.1.0",
+  "description": "The LinkedIn API for AI agents. Search, inbox, posts and outreach over MCP.",
+  "version": "1.1.1",
   "websiteUrl": "https://crispy.sh",
   "repository": {
     "url": "https://github.com/shyftai/crispy-mcp",
@@ -13,7 +13,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "crispy-mcp",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "transport": {
         "type": "stdio"
       },
