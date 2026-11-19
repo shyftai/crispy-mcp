@@ -25,6 +25,7 @@ interface PackageJson {
 
 interface ServerJson {
   name: string;
+  description?: string;
   version: string;
   packages?: Array<{
     registryType: string;
@@ -75,6 +76,7 @@ describe("public metadata copy", () => {
 const retiredListingLiterals: ReadonlyArray<RegExp> = [
   /\b\d{2,3}\+\s+(?:LinkedIn\s+)?tools\b/i,
   /one flat per-seat price/i,
+  /\b(?:full|complete|entire)\s+linkedin\s+(?:access|surface)\b/i,
 ];
 
 describe("retired listing copy", () => {
@@ -150,6 +152,12 @@ describe("registry manifests", () => {
     ).toBe(pkg.version);
   });
 
+  it("provides a non-empty server.json description within the 100-character registry limit", () => {
+    expect(server.description).toBeTypeOf("string");
+    expect(server.description!.trim().length).toBeGreaterThan(0);
+    expect(server.description!.length).toBeLessThanOrEqual(100);
+  });
+
   it("lets registry clients discover OAuth without a required Authorization header", () => {
     expect(
       streamableHttpRemote,
@@ -166,7 +174,7 @@ describe("registry manifests", () => {
   // only reaches npm in a version that has not been published yet. Rejecting
   // the literal string "1.0.0" is not that property -- "1.0" and "0.9.0" pass
   // it and neither is publishable.
-  it("publishes a valid semver above 1.0.0, identical in all three places", () => {
+  it("publishes a valid semver above 1.1.0, identical in all three places", () => {
     const match = SEMVER.exec(pkg.version);
     expect(
       match,
@@ -174,13 +182,18 @@ describe("registry manifests", () => {
     ).not.toBeNull();
 
     const core = match!.slice(1, 4).map(Number) as [number, number, number];
+    expect(match![4], "release version must not be a prerelease").toBeUndefined();
     expect(
-      isAbove(core, [1, 0, 0]),
-      `crispy-mcp@1.0.0 is already on npm and immutable; ${pkg.version} must be above it`,
+      isAbove(core, [1, 1, 0]),
+      `crispy-mcp@1.1.0 is already published and immutable; ${pkg.version} must be above it`,
     ).toBe(true);
 
     expect(server.version).toBe(pkg.version);
     expect(npmPackage?.version).toBe(pkg.version);
+
+    const lock = readManifest<{ version: string; packages?: Record<string, { version?: string }> }>("package-lock.json");
+    expect(lock.version).toBe(pkg.version);
+    expect(lock.packages?.[""]?.version).toBe(pkg.version);
   });
 
   // SEMVER is the whole of the assertion above, so it gets held honest here:
