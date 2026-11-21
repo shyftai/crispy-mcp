@@ -236,6 +236,20 @@ The bridge forwards `initialize`, `tools/list`, `tools/call` and every other met
 
 ---
 
+## Agent skill
+
+This repo ships an agent skill. It packs the connection details, the main
+workflows and the safety rules into one file that any agent can load.
+
+- [skills/crispy-linkedin/SKILL.md](skills/crispy-linkedin/SKILL.md)
+
+Drop the folder into your agent's skills directory. The agent picks the skill up
+when the task matches its description. The skill names no tools, because the
+server ships the tool list at runtime. Ask for `tools/list` and work from what
+comes back.
+
+---
+
 ## Links
 
 - Homepage: https://crispy.sh
