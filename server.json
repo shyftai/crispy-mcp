@@ -1,6 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "sh.crispy/crispy",
+  "title": "Crispy",
   "description": "The LinkedIn API for AI agents. Search, inbox, posts and outreach over MCP.",
   "version": "1.1.1",
   "websiteUrl": "https://crispy.sh",
