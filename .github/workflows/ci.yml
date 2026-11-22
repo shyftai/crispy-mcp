@@ -42,7 +42,7 @@ jobs:
           now=$(date +%s)
           lisbon='["self-hosted","linux","x64","lisbon"]'
           boxd='["self-hosted","linux","boxd"]'
-          gh='"ubuntu-latest"'
+          gh='"ubuntu-24.04"'
           fb=$gh; [ "$FALLBACK" = "boxd" ] && fb=$boxd
           if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
             pick=$gh
