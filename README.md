@@ -1,6 +1,6 @@
 # Crispy — the LinkedIn MCP server for AI agents
 
-**The LinkedIn API for AI agents, via MCP.** Search, inbox, posts and outreach. Connect Claude, Cursor, Codex, VS Code, JetBrains, n8n, or anything that speaks MCP, and run prospecting, messaging, and campaigns with activity limits built in.
+**Your AI agent runs LinkedIn safely and gets the job done, via MCP.** Search, inbox, posts and outreach. Connect Claude, Cursor, Codex, VS Code, JetBrains, n8n, or anything that speaks MCP, and run prospecting, messaging, and campaigns with activity limits built in.
 
 - **Website:** https://crispy.sh
 - **MCP endpoint:** `https://crispy.sh/api/mcp` (Streamable HTTP)
