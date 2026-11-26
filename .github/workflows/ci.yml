@@ -17,50 +17,19 @@ permissions:
   contents: read
 
 jobs:
-  # Picks the runner pool. Always GitHub-hosted so it can never get stuck queued.
-  # Order: (1) a pull request from a fork NEVER gets a self-hosted pool, whatever the variables say
-  # (the Lisbon runners also refuse fork jobs in a job-start hook, because a fork can edit this file);
-  # (2) CI_FORCE_POOL=lisbon|boxd|github wins; (3) Lisbon if its heartbeat variable is < 300 s old;
-  # (4) else CI_FALLBACK_POOL (boxd) or ubuntu-latest. Only vars, the clock and the event's repo names
-  # reach this script, all through env, never through ${{ }} inside run.
   route:
+    # Kept only so the required check `route runner` still exists (merge.mjs reads required checks
+    # from the base workflow). It routes nothing: each job picks its pool from vars.LISBON_POOL.
     name: route runner
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.LISBON_POOL == 'github' || (github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","lisbon"]') }}
     timeout-minutes: 2
-    permissions: {}
-    outputs:
-      runs_on: ${{ steps.pick.outputs.runs_on }}
     steps:
-      - id: pick
-        env:
-          HEARTBEAT: ${{ vars.LISBON_HEARTBEAT_EPOCH }}
-          FORCE: ${{ vars.CI_FORCE_POOL }}
-          FALLBACK: ${{ vars.CI_FALLBACK_POOL }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          THIS_REPO: ${{ github.repository }}
-        run: |
-          now=$(date +%s)
-          lisbon='["self-hosted","linux","x64","lisbon"]'
-          boxd='["self-hosted","linux","boxd"]'
-          gh='"ubuntu-24.04"'
-          fb=$gh; [ "$FALLBACK" = "boxd" ] && fb=$boxd
-          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
-            pick=$gh
-          elif [ -n "$FORCE" ]; then
-            case "$FORCE" in lisbon) pick=$lisbon;; boxd) pick=$boxd;; *) pick=$gh;; esac
-          elif [[ "$HEARTBEAT" =~ ^[0-9]+$ ]] && [ $((now - HEARTBEAT)) -lt 300 ] && [ $((now - HEARTBEAT)) -ge -60 ]; then
-            pick=$lisbon
-          else
-            pick=$fb
-          fi
-          echo "heartbeat=${HEARTBEAT:-unset} now=$now head=${HEAD_REPO:-none} pick=$pick"
-          echo "runs_on=$pick" >> "$GITHUB_OUTPUT"
+      - run: echo "runner pool is chosen per job from vars.LISBON_POOL"
 
   # Runs on the pool the route job picks (Lisbon, else the fallback). Rollback: revert this commit.
   test:
     name: build + test (node ${{ matrix.node }})
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.runs_on) }}
+    runs-on: ${{ (vars.LISBON_POOL == 'github' || (github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || fromJSON('["self-hosted","linux","x64","lisbon"]') }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
