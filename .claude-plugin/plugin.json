@@ -2,7 +2,7 @@
   "name": "crispy",
   "displayName": "Crispy",
   "description": "Hosted LinkedIn MCP server for AI agents on your own account. People search, profiles, invitations, messages and campaigns, under daily caps per action category.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": {
     "name": "Shyft AI LLC"
   },

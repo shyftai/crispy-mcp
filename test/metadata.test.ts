@@ -56,7 +56,7 @@ const unsupportedLinkedInClaims =
   /safe sending limits|safe limits built in|sustainable by default|human-like|humanlike/i;
 
 describe("public metadata copy", () => {
-  it.each(["README.md", "package.json", "server.json"])(
+  it.each(["README.md", "package.json", "server.json", ".claude-plugin/plugin.json"])(
     "does not advertise unsupported LinkedIn safety claims in %s",
     (name) => {
       expect(readRepositoryFile(name)).not.toMatch(unsupportedLinkedInClaims);
@@ -83,6 +83,50 @@ function isAbove(version: Core, floor: Core): boolean {
   }
   return false;
 }
+
+interface PluginJson {
+  name?: string;
+  displayName?: string;
+  description?: string;
+  version?: string;
+  homepage?: string;
+  repository?: string;
+  license?: string;
+}
+
+interface McpJson {
+  mcpServers?: Record<
+    string,
+    { type?: string; url?: string; headers?: unknown; oauth?: unknown }
+  >;
+}
+
+describe("Claude Code plugin manifests", () => {
+  const plugin = readManifest<PluginJson>(".claude-plugin/plugin.json");
+  const mcp = readManifest<McpJson>(".mcp.json");
+
+  it("keeps plugin.json identity and version in step with package.json", () => {
+    expect(plugin.name).toBe("crispy");
+    expect(plugin.displayName).toBe("Crispy");
+    expect(plugin.description, "plugin.json description is empty").toBeTruthy();
+    expect(plugin.homepage).toBe("https://crispy.sh");
+    expect(plugin.repository).toBe("https://github.com/shyftai/crispy-mcp");
+    expect(plugin.license).toBe("MIT");
+    expect(plugin.version, "bump plugin.json with package.json").toBe(pkg.version);
+  });
+
+  it("declares the hosted server over http with OAuth discovery intact", () => {
+    const entry = mcp.mcpServers?.crispy;
+    expect(entry, ".mcp.json has no crispy server").toBeDefined();
+    expect(entry?.type).toBe("http");
+    expect(entry?.url).toBe(streamableHttpRemote?.url);
+    expect(entry?.headers, "headers break OAuth discovery").toBeUndefined();
+    if (entry && "oauth" in entry) {
+      // A boolean oauth key makes the loader drop the server.
+      expect(typeof entry.oauth).toBe("object");
+    }
+  });
+});
 
 describe("registry manifests", () => {
   it("claims the server name in package.json so the registry can verify npm ownership", () => {
