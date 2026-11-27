@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "crispy": {
+      "type": "http",
+      "url": "https://crispy.sh/api/mcp"
+    }
+  }
+}
